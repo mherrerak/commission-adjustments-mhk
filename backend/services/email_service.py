@@ -96,6 +96,7 @@ def _enviar_resend(subject: str, html: str, adjuntos: list, cfg: dict):
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "User-Agent": "resend-python/1.0.0",
         },
         method="POST"
     )
