@@ -15,7 +15,7 @@ import io
 import logging
 from datetime import date
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Header
 from fastapi.responses import StreamingResponse
 
 from models import ComisionCreate
@@ -288,6 +288,163 @@ async def exportar_comisiones(
         headers={"Content-Disposition": f'attachment; filename="{nombre_archivo}"'}
     )
 
+# ── GET /api/comisiones/template ───────────────────────────────────────────────
+
+@router.get("/comisiones/template")
+async def descargar_template():
+    """Descarga el template Excel para carga masiva de comisiones."""
+    from services.excel_service import generar_template_masivo
+    buf = generar_template_masivo()
+    nombre = f"Template_Carga_Masiva_{date.today().isoformat()}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}"'}
+    )
+
+
+# ── POST /api/comisiones/masivo ────────────────────────────────────────────
+
+@router.post("/comisiones/masivo", status_code=200)
+async def cargar_masivo(file: UploadFile = File(...)):
+    """
+    Procesa un Excel de carga masiva.
+    Columnas esperadas: tipo, codigo, comision_anterior, comision_nueva,
+                        fecha_inicio, fecha_termino, responsable, motivo
+    Retorna: {insertados: int, errores: [{fila, errores}]}
+    """
+    import openpyxl
+    from datetime import datetime as dt
+    from services.email_service import enviar_email_carga
+
+    content = await file.read()
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(content))
+        ws = wb.active
+    except Exception as e:
+        raise HTTPException(400, f"No se pudo leer el archivo Excel: {e}")
+
+    actualizar_estados_automatico()
+
+    items_ok = []
+    errores = []
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if not any(cell is not None and str(cell).strip() != '' for cell in row):
+            continue  # fila vacía
+
+        cols = list(row) + [None] * 8
+        tipo, codigo, com_ant, com_nva, f_inicio, f_termino, responsable, motivo = cols[:8]
+
+        fila_err = []
+        # Validar tipo
+        tipo = str(tipo).strip() if tipo else ''
+        if tipo not in ('SKU', 'Seller'):
+            fila_err.append("tipo debe ser 'SKU' o 'Seller'")
+        # Validar codigo
+        codigo = str(codigo).strip() if codigo else ''
+        if not codigo:
+            fila_err.append("codigo vacío")
+        # Validar comisiones
+        try:
+            com_ant = float(com_ant)
+            if not (0 <= com_ant <= 100): raise ValueError()
+        except (TypeError, ValueError):
+            fila_err.append("comision_anterior inválida (0-100)")
+            com_ant = None
+        try:
+            com_nva = float(com_nva)
+            if not (0 <= com_nva <= 100): raise ValueError()
+        except (TypeError, ValueError):
+            fila_err.append("comision_nueva inválida (0-100)")
+            com_nva = None
+        if com_ant is not None and com_nva is not None and com_ant == com_nva:
+            fila_err.append("comision_nueva debe ser distinta a comision_anterior")
+        # Validar fechas
+        def _parse_fecha(v):
+            if v is None: return None
+            if isinstance(v, (dt,)): return v.date().isoformat()
+            if hasattr(v, 'isoformat'): return v.isoformat()
+            s = str(v).strip()
+            for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y'):
+                try: return dt.strptime(s, fmt).date().isoformat()
+                except: pass
+            return None
+        f_inicio_str = _parse_fecha(f_inicio)
+        f_termino_str = _parse_fecha(f_termino)
+        if not f_inicio_str:
+            fila_err.append("fecha_inicio inválida (use YYYY-MM-DD)")
+        if not f_termino_str:
+            fila_err.append("fecha_termino inválida (use YYYY-MM-DD)")
+        if f_inicio_str and f_termino_str and f_termino_str <= f_inicio_str:
+            fila_err.append("fecha_termino debe ser posterior a fecha_inicio")
+        # Validar responsable
+        responsable = str(responsable).strip() if responsable else ''
+        if not responsable:
+            fila_err.append("responsable vacío")
+
+        if fila_err:
+            errores.append({"fila": row_idx, "errores": fila_err})
+            continue
+
+        items_ok.append({
+            'tipo': tipo,
+            'codigo': codigo,
+            'comision_anterior': com_ant,
+            'comision_nueva': com_nva,
+            'fecha_inicio': f_inicio_str,
+            'fecha_termino': f_termino_str,
+            'responsable': responsable,
+            'motivo': str(motivo).strip() if motivo else None
+        })
+
+    # Insertar los registros válidos
+    insertados = []
+    for item in items_ok:
+        try:
+            estado = _calcular_estado(item['fecha_inicio'], item['fecha_termino'], 'Programada')
+            with _write_lock:
+                conn = get_connection()
+                try:
+                    # Validar solapamiento
+                    existe = conn.execute("""
+                        SELECT id FROM comisiones
+                        WHERE tipo = ? AND codigo = ?
+                          AND estado NOT IN ('Anulada', 'Vencida', 'Vencida_Notificada')
+                          AND fecha_inicio <= ? AND fecha_termino >= ?
+                    """, (item['tipo'], item['codigo'], item['fecha_termino'], item['fecha_inicio'])).fetchone()
+                    if existe:
+                        errores.append({"fila": "?", "errores": [
+                            f"{item['tipo']} {item['codigo']}: solapamiento con comisión ID {existe['id']}"
+                        ]})
+                        continue
+                    cursor = conn.execute("""
+                        INSERT INTO comisiones
+                          (tipo, codigo, comision_anterior, comision_nueva,
+                           fecha_inicio, fecha_termino, responsable, motivo, estado)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        item['tipo'], item['codigo'], item['comision_anterior'], item['comision_nueva'],
+                        item['fecha_inicio'], item['fecha_termino'], item['responsable'],
+                        item['motivo'], estado
+                    ))
+                    conn.commit()
+                    row = conn.execute("SELECT * FROM comisiones WHERE id = ?", (cursor.lastrowid,)).fetchone()
+                    insertados.append(_row_to_dict(row))
+                finally:
+                    conn.close()
+        except Exception as e:
+            logger.warning(f"Error insertando fila masiva: {e}")
+            errores.append({"fila": "?", "errores": [str(e)]})
+
+    # Enviar email si hay inserciones
+    if insertados:
+        try:
+            enviar_email_carga(insertados)
+        except Exception as e:
+            logger.warning(f"No se pudo enviar email de carga masiva: {e}")
+
+    return {"insertados": len(insertados), "errores": errores}
 
 # ── PUT /api/comisiones/{id}/anular ───────────────────────────────────────────
 
@@ -329,6 +486,42 @@ async def anular_comision(comision_id: int):
                 "mensaje": f"Comisión ID {comision_id} anulada correctamente",
                 "comision": _row_to_dict(row)
             }
+        finally:
+            conn.close()
+
+
+# ── DELETE /api/comisiones/{id} ───────────────────────────────────────────────
+
+@router.delete("/comisiones/{comision_id}")
+async def eliminar_comision(comision_id: int, x_admin_pin: str = Header(default=None)):
+    """
+    Elimina permanentemente una comisión anulada.
+    Solo funciona para estado='Anulada' y requiere el PIN de administrador.
+    """
+    pin_correcto = os.getenv("ADMIN_PIN", "")
+    if not pin_correcto or x_admin_pin != pin_correcto:
+        raise HTTPException(status_code=403, detail="PIN incorrecto")
+
+    with _write_lock:
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM comisiones WHERE id = ?", (comision_id,)
+            ).fetchone()
+
+            if not row:
+                raise HTTPException(status_code=404, detail="Comisión no encontrada")
+
+            comision = _row_to_dict(row)
+            if comision["estado"] != "Anulada":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Solo se pueden eliminar comisiones con estado 'Anulada'. Estado actual: '{comision['estado']}'"
+                )
+
+            conn.execute("DELETE FROM comisiones WHERE id = ?", (comision_id,))
+            conn.commit()
+            return {"success": True, "mensaje": f"Comisión ID {comision_id} eliminada permanentemente"}
         finally:
             conn.close()
 
