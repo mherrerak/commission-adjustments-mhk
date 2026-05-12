@@ -1,0 +1,1152 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Commission Adjustments by MHK</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <!-- React + ReactDOM vía CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel Standalone para transpilación de JSX en el navegador -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    /* ═══════════════════════════════════════════════════════════════
+       CAPA DE API — todas las llamadas al backend centralizadas aquí
+    ═══════════════════════════════════════════════════════════════ */
+    const API = {
+      base: '/api',
+
+      async get(path, params = {}) {
+        const qs = new URLSearchParams(
+          Object.fromEntries(Object.entries(params).filter(([,v]) => v !== null && v !== undefined && v !== ''))
+        ).toString();
+        const url = qs ? `${this.base}${path}?${qs}` : `${this.base}${path}`;
+        const r = await fetch(url);
+        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.detail || `Error ${r.status}`); }
+        return r.json();
+      },
+
+      async post(path, body) {
+        const r = await fetch(`${this.base}${path}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || `Error ${r.status}`);
+        return data;
+      },
+
+      async put(path) {
+        const r = await fetch(`${this.base}${path}`, { method: 'PUT' });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || `Error ${r.status}`);
+        return data;
+      },
+
+      exportUrl(params = {}) {
+        const qs = new URLSearchParams(
+          Object.fromEntries(Object.entries(params).filter(([,v]) => v !== null && v !== undefined && v !== ''))
+        ).toString();
+        return qs ? `${this.base}/comisiones/export?${qs}` : `${this.base}/comisiones/export`;
+      },
+
+      async del(path, headers = {}) {
+        const r = await fetch(`${this.base}${path}`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json', ...headers }
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || `Error ${r.status}`);
+        return data;
+      }
+    };
+
+    /* ═══════════════════════════════════════════════════════════════
+       UTILIDADES
+    ═══════════════════════════════════════════════════════════════ */
+    const ESTADOS = ['Activa', 'Programada', 'Vencida', 'Vencida_Notificada', 'Anulada'];
+    const ESTADOS_LABEL = {
+      'Activa': 'Activa',
+      'Programada': 'Programada',
+      'Vencida': 'Vencida',
+      'Vencida_Notificada': 'Vencida Notif.',
+      'Anulada': 'Anulada'
+    };
+
+    function BadgeEstado({ estado }) {
+      const cls = `badge badge-${estado.toLowerCase().replace('_','-')}`;
+      const icons = { Activa:'●', Programada:'◐', Vencida:'✕', Vencida_Notificada:'✕', Anulada:'—' };
+      return <span className={cls}>{icons[estado] || ''} {ESTADOS_LABEL[estado] || estado}</span>;
+    }
+
+    function ChipTipo({ tipo }) {
+      return tipo === 'SKU'
+        ? <span className="chip-sku">SKU</span>
+        : <span className="chip-seller">Seller</span>;
+    }
+
+    function DiasTag({ fechaTermino, estado }) {
+      if (estado === 'Programada') return <span className="dias-tag dias-futuro">Progr.</span>;
+      if (['Vencida','Vencida_Notificada','Anulada'].includes(estado))
+        return <span className="dias-tag dias-critico">Vencida</span>;
+      const hoy = new Date(); hoy.setHours(0,0,0,0);
+      const fin = new Date(fechaTermino + 'T00:00:00');
+      const dias = Math.round((fin - hoy) / 86400000);
+      if (dias < 0)  return <span className="dias-tag dias-critico">Vencida</span>;
+      if (dias === 0) return <span className="dias-tag dias-critico">⚠ Hoy</span>;
+      if (dias <= 2) return <span className="dias-tag dias-urgente">⚠ {dias}d</span>;
+      return <span className="dias-tag dias-normal">{dias}d</span>;
+    }
+
+    function VarComision({ anterior, nueva }) {
+      const diff = nueva - anterior;
+      if (diff > 0) return <span className="var-sube">▲ {diff.toFixed(1)}%</span>;
+      if (diff < 0) return <span className="var-baja">▼ {Math.abs(diff).toFixed(1)}%</span>;
+      return <span>—</span>;
+    }
+
+    function formatFecha(iso) {
+      if (!iso) return '—';
+      const [y, m, d] = iso.split('-');
+      return `${d}/${m}/${y}`;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       COMPONENTE: Toast / Notificaciones
+    ═══════════════════════════════════════════════════════════════ */
+    function AlertContainer({ alerts, onDismiss }) {
+      return (
+        <div className="alert-container">
+          {alerts.map(a => (
+            <div key={a.id} className={`alert alert-${a.type}`}>
+              <div className="alert-body">
+                <div className="alert-title">{a.title}</div>
+                {a.message && <div className="alert-msg">{a.message}</div>}
+              </div>
+              <button className="alert-close" onClick={() => onDismiss(a.id)}>×</button>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       COMPONENTE: Modal de confirmación
+    ═══════════════════════════════════════════════════════════════ */
+    function Modal({ title, body, onConfirm, onCancel, loading, confirmLabel = 'Confirmar', confirmClass = 'btn-danger' }) {
+      return (
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onCancel()}>
+          <div className="modal">
+            <div className="modal-title">{title}</div>
+            <div className="modal-body">{body}</div>
+            <div className="modal-actions">
+              <button className="btn btn-ghost" onClick={onCancel} disabled={loading}>Cancelar</button>
+              <button className={`btn ${confirmClass}`} onClick={onConfirm} disabled={loading}>
+                {loading && <span className="spinner" style={{width:14,height:14}}></span>}
+                {confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const FalabellaLogo = () => (
+      <svg width="140" height="21" viewBox="0 0 187 28" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Falabella" style={{display:"block",flexShrink:0}}>
+        <path fillRule="evenodd" clipRule="evenodd" d="M71.8541 7.24407C74.8253 8.20226 76.657 10.2796 77.3779 13.2178C78.0681 16.0268 77.3003 18.7185 75.5768 20.8615C73.3019 23.6843 67.6188 24.9367 64.0942 22.1834L63.9656 23.3046H60.1571V17.9293V4.35758C60.1571 1.95018 62.1624 0 64.6333 0V8.38515C66.269 6.87431 69.1565 6.35546 71.8541 7.24407ZM69.2709 19.6727C71.1108 19.4699 72.3483 18.4163 72.8853 16.7087C73.6368 13.9176 72.0277 10.4765 67.8026 10.8979C65.7299 11.206 64.7355 12.7029 64.7355 12.7029V17.9273C65.9096 19.3208 67.531 19.8655 69.2709 19.6727ZM11.5295 4.18248H7.18195C5.6892 4.18248 4.47621 5.36133 4.47621 6.81451V9.35511H9.52623V13.5019H4.47621V23.6424C4.47621 26.0498 2.4709 28 0 28V7.00336C0 3.1547 3.204 0.0356369 7.15743 0.0356369H11.5295V4.18248ZM37.0615 23.3402H32.5853V4.40104C32.5853 1.99364 34.5906 0.043477 37.0615 0.043477V23.3402ZM104.237 23.3402H99.761V4.40104C99.761 1.99364 101.766 0.043477 104.237 0.043477V23.3402ZM107.28 23.3402H111.756V0.043477C109.285 0.043477 107.28 1.99364 107.28 4.40104V23.3402ZM88.9809 23.7598C82.2421 23.7598 79.4486 19.2014 79.7283 14.5457C79.9468 10.9276 82.8057 6.8086 88.7093 6.8086C95.3889 6.8086 98.0701 12.7028 97.0981 17.0664H84.5496C84.8008 18.7044 86.4324 19.8336 88.6317 19.9767C91.268 20.1477 92.967 18.2214 92.967 18.2214L96.3671 19.9688C94.7069 22.6585 92.0665 23.7598 88.9809 23.7598ZM88.7011 10.5956C85.5339 10.5758 84.566 13.1939 84.5823 13.9393H92.675C92.7485 13.2833 92.1012 10.6155 88.7011 10.5956ZM29.5814 7.65382C28.5767 7.65382 27.6557 7.99376 26.9308 8.55635C24.7294 7.00973 21.5091 6.2046 17.9539 7.3755C15.001 8.32772 13.1795 10.3932 12.4628 13.3135C11.7766 16.1065 12.5404 18.7843 14.2536 20.9094C16.5081 23.7045 22.1197 24.9509 25.6259 22.2592L25.9792 23.3407H29.5834V11.7092L29.5814 7.65382ZM25.1603 18.0945C23.9004 19.5119 22.2524 19.8339 20.5207 19.6431C18.6931 19.4403 17.4617 18.4841 16.9267 16.7844C16.1793 14.0113 17.7803 10.5006 21.9788 10.92C24.2863 11.2679 25.1583 12.902 25.1583 12.902V18.0945H25.1603ZM129.438 8.56009C130.163 7.99552 131.084 7.65756 132.089 7.65756H132.091V11.713V23.3444H128.487L128.133 22.263C124.627 24.9546 119.016 23.7082 116.761 20.9132C115.048 18.7881 114.284 16.1103 114.97 13.3172C115.687 10.3969 117.509 8.33147 120.461 7.37924C124.017 6.20834 127.237 7.01347 129.438 8.56009ZM123.028 19.6468C124.76 19.8377 126.408 19.5156 127.668 18.0982H127.666V12.9057C127.666 12.9057 126.794 11.2716 124.486 10.9238C120.288 10.5043 118.687 14.015 119.434 16.7882C119.969 18.4879 121.201 19.4441 123.028 19.6468ZM54.4985 8.55635C52.2972 7.00973 49.0769 6.2046 45.5216 7.3755C42.5688 8.32772 40.7473 10.3932 40.0305 13.3135C39.3444 16.1065 40.1081 18.7843 41.8214 20.9094C44.0758 23.7045 49.6874 24.9509 53.1936 22.2592L53.5469 23.3407H57.1512V11.7092V7.65183C56.1444 7.65381 55.2255 7.99177 54.4985 8.55635ZM52.7281 18.0945C51.4681 19.5119 49.8202 19.8339 48.0885 19.6431C46.2608 19.4403 45.0295 18.4841 44.4945 16.7844C43.7471 14.0113 45.348 10.5006 49.5465 10.92C51.8541 11.2679 52.726 12.902 52.726 12.902V18.0945H52.7281ZM151.327 16.6134C151.327 12.7946 154.321 9.91204 158.291 9.91204C162.275 9.91204 165.279 12.7926 165.281 16.6134C165.281 20.4501 162.275 23.3406 158.291 23.3406C154.321 23.3406 151.327 20.4501 151.327 16.6134ZM154.915 16.6114C154.915 18.6332 156.332 20.1002 158.289 20.1002C160.229 20.1002 161.693 18.6013 161.693 16.6114C161.693 14.6394 160.231 13.1524 158.289 13.1524C156.365 13.1524 154.915 14.6394 154.915 16.6114ZM181.778 9.91212C179.722 9.75905 177.964 10.7968 176.984 11.3872C175.859 10.5045 174.605 9.91212 173.002 9.91212C170.016 9.91212 166.969 11.6575 166.969 11.6575V23.0365H170.453V13.6037C171.015 13.2081 172.03 13.1545 172.597 13.1545C173.788 13.1545 175.176 14.063 175.176 15.5977V23.0365H178.66V14.7428C178.66 14.0749 178.472 13.7349 178.472 13.7349C180.796 12.4726 183.516 13.4348 183.516 15.5977V23.0365H187V15.546C186.998 11.908 184.108 10.0851 181.778 9.91212ZM145.299 13.1522C143.645 13.1522 142.248 14.514 141.977 16.0705C141.099 15.2376 139.945 14.679 138.66 14.5299C139.549 11.7925 142.177 9.9099 145.456 9.9099C148.368 9.9099 150.374 11.4983 150.374 11.4983L148.593 14.2218C148.593 14.2218 147.237 13.1522 145.299 13.1522ZM148.687 18.9547C148.687 18.9547 147.353 20.0978 145.301 20.0978C144.721 20.0978 144.174 19.9288 143.694 19.6426C143.704 19.7817 143.712 19.9209 143.712 20.062C143.712 21.1077 143.416 22.0857 142.902 22.9227C143.69 23.193 144.55 23.3401 145.46 23.3401C148.722 23.3401 150.551 21.5013 150.551 21.5013L148.687 18.9547ZM141.19 20.0642C141.19 21.7869 139.756 23.1833 137.986 23.1833C136.217 23.1833 134.782 21.7869 134.782 20.0642C134.782 18.3416 136.217 16.9452 137.986 16.9452C139.756 16.9452 141.19 18.3416 141.19 20.0642Z" fill="white"/>
+      </svg>
+    );
+
+    /* ═══════════════════════════════════════════════════════════════
+       COMPONENTE: Navbar
+    ═══════════════════════════════════════════════════════════════ */
+    function Navbar({ page, onChange, stats }) {
+      return (
+        <nav className="navbar">
+          <div className="navbar-logo">
+            <FalabellaLogo />
+            <div className="navbar-divider" />
+            <div className="navbar-logo-text">
+              <span className="navbar-logo-app">Commission Adjustments</span>
+              <span className="navbar-logo-sub"> By MHK</span>
+            </div>
+          </div>
+          <div className="navbar-nav">
+            <button className={"nav-btn" + (page === "dashboard" ? " active" : "")} onClick={() => onChange("dashboard")}>
+              Dashboard
+            </button>
+            <button className={"nav-btn" + (page === "nueva" ? " active" : "")} onClick={() => onChange("nueva")}>
+              + Nueva
+            </button>
+            <button className={"nav-btn" + (page === "historico" ? " active" : "")} onClick={() => onChange("historico")}>
+              Historico
+            </button>
+          </div>
+          {stats && stats.proximas_a_vencer > 0 && (
+            <div className="navbar-status" style={{color:"#ffeb3b", fontWeight:600}}>
+              {stats.proximas_a_vencer} vencen pronto
+            </div>
+          )}
+        </nav>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       COMPONENTE: Stats Cards
+    ═══════════════════════════════════════════════════════════════ */
+    function StatsGrid({ stats }) {
+      if (!stats) return null;
+      return (
+        <div className="stats-grid">
+          <div className="stat-card activa">
+            <div className="stat-label">Activas</div>
+            <div className="stat-value">{stats.total_activa ?? 0}</div>
+          </div>
+          <div className="stat-card programada">
+            <div className="stat-label">Programadas</div>
+            <div className="stat-value">{stats.total_programada ?? 0}</div>
+          </div>
+          <div className="stat-card warning">
+            <div className="stat-label">Vencen Pronto</div>
+            <div className="stat-value">{stats.proximas_a_vencer ?? 0}</div>
+          </div>
+          <div className="stat-card vencida">
+            <div className="stat-label">Vencidas</div>
+            <div className="stat-value">{(stats.total_vencida ?? 0) + (stats.total_vencida_notificada ?? 0)}</div>
+          </div>
+          <div className="stat-card anulada">
+            <div className="stat-label">Anuladas</div>
+            <div className="stat-value">{stats.total_anulada ?? 0}</div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       COMPONENTE: Tabla de comisiones (reutilizada en Dashboard e Histórico)
+    ═══════════════════════════════════════════════════════════════ */
+    function ComisionesTable({ comisiones, loading, onAnular, onEliminar, showEstado = true, exportParams = {} }) {
+      const [sortCol, setSortCol] = useState('fecha_termino');
+      const [sortDir, setSortDir] = useState('asc');
+      const [modalAnular, setModalAnular] = useState(null);
+      const [anulando, setAnulando] = useState(false);
+      const [modalEliminar, setModalEliminar] = useState(null);
+      const [pin, setPin] = useState('');
+      const [eliminando, setEliminando] = useState(false);
+      const [pinError, setPinError] = useState('');
+
+      const handleSort = (col) => {
+        if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+        else { setSortCol(col); setSortDir('asc'); }
+      };
+
+      const sorted = [...comisiones].sort((a, b) => {
+        let va = a[sortCol], vb = b[sortCol];
+        if (va === null || va === undefined) va = '';
+        if (vb === null || vb === undefined) vb = '';
+        const cmp = String(va).localeCompare(String(vb), undefined, { numeric: true });
+        return sortDir === 'asc' ? cmp : -cmp;
+      });
+
+      const SortTh = ({ col, label }) => (
+        <th onClick={() => handleSort(col)} className={sortCol === col ? 'sorted' : ''}>
+          {label}
+          <span className="sort-icon">{sortCol === col ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ' ↕'}</span>
+        </th>
+      );
+
+      const handleAnularConfirm = async () => {
+        setAnulando(true);
+        try { await onAnular(modalAnular.id); }
+        finally { setAnulando(false); setModalAnular(null); }
+      };
+
+      const canAnular = (c) => ['Activa', 'Programada'].includes(c.estado);
+      const canEliminar = (c) => c.estado === 'Anulada' && onEliminar;
+
+      const handleEliminarConfirm = async () => {
+        setPinError('');
+        setEliminando(true);
+        try {
+          await onEliminar(modalEliminar.id, pin);
+          setModalEliminar(null);
+          setPin('');
+        } catch(e) {
+          setPinError(e.message);
+        } finally {
+          setEliminando(false);
+        }
+      };
+
+      if (loading) return <div className="loading"><span className="spinner"></span>Cargando comisiones...</div>;
+
+      if (!comisiones.length) return (
+        <div className="empty-state">
+          <div className="empty-state-icon">📭</div>
+          <div className="empty-state-msg">No se encontraron comisiones con los filtros aplicados</div>
+        </div>
+      );
+
+      return (
+        <>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <SortTh col="tipo" label="Tipo" />
+                  <SortTh col="codigo" label="Código" />
+                  <SortTh col="comision_anterior" label="Com. Anterior" />
+                  <SortTh col="comision_nueva" label="Com. Nueva" />
+                  <th>Variación</th>
+                  <SortTh col="fecha_inicio" label="F. Inicio" />
+                  <SortTh col="fecha_termino" label="F. Término" />
+                  <th>Días Rest.</th>
+                  <SortTh col="responsable" label="Responsable" />
+                  {showEstado && <SortTh col="estado" label="Estado" />}
+                  <th>Acciones</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map(c => (
+                  <tr key={c.id}>
+                    <td><ChipTipo tipo={c.tipo} /></td>
+                    <td><span className="code-cell">{c.codigo}</span></td>
+                    <td>{c.comision_anterior?.toFixed(1)}%</td>
+                    <td style={{fontWeight:600}}>{c.comision_nueva?.toFixed(1)}%</td>
+                    <td><VarComision anterior={c.comision_anterior} nueva={c.comision_nueva} /></td>
+                    <td>{formatFecha(c.fecha_inicio)}</td>
+                    <td>{formatFecha(c.fecha_termino)}</td>
+                    <td><DiasTag fechaTermino={c.fecha_termino} estado={c.estado} /></td>
+                    <td>{c.responsable}</td>
+                    {showEstado && <td><BadgeEstado estado={c.estado} /></td>}
+                    <td>
+                      {canAnular(c) ? (
+                        <button
+                          className="btn btn-sm btn-ghost"
+                          onClick={() => setModalAnular(c)}
+                          title="Anular comisión"
+                        >
+                          🗑 Anular
+                        </button>
+                      ) : canEliminar(c) ? (
+                        <button
+                          className="btn btn-sm"
+                          style={{background:'#fdecea',color:'#c62828',border:'1px solid #f5c6c6'}}
+                          onClick={() => { setPin(''); setPinError(''); setModalEliminar(c); }}
+                          title="Eliminar registro permanentemente"
+                        >
+                          🗑 Eliminar
+                        </button>
+                      ) : (
+                        <span style={{color:'#9aa0a6',fontSize:'.75rem'}}>{c.estado}</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {modalAnular && (
+            <Modal
+              title="¿Anular esta comisión?"
+              body={
+                <span>
+                  ¿Confirmas que deseas anular la comisión del {modalAnular.tipo}{' '}
+                  <strong>{modalAnular.codigo}</strong> ({modalAnular.comision_nueva}%)?
+                  <br /><br />
+                  Esta acción no se puede deshacer.
+                </span>
+              }
+              onConfirm={handleAnularConfirm}
+              onCancel={() => setModalAnular(null)}
+              loading={anulando}
+              confirmLabel="Sí, anular"
+            />
+          )}
+
+          {modalEliminar && (
+            <Modal
+              title="Eliminar comisión permanentemente"
+              body={
+                <div>
+                  <p style={{marginBottom:12}}>Vas a <strong>eliminar de forma permanente</strong> la comisión:</p>
+                  <p style={{marginBottom:16}}>{modalEliminar.tipo} <strong>{modalEliminar.codigo}</strong> — {modalEliminar.comision_nueva}%</p>
+                  <label style={{display:'block',marginBottom:6,fontWeight:600}}>PIN de administrador</label>
+                  <input
+                    type="password"
+                    className="form-input"
+                    placeholder="Ingresa el PIN"
+                    value={pin}
+                    onChange={e => { setPin(e.target.value); setPinError(''); }}
+                    autoFocus
+                  />
+                  {pinError && <p style={{color:'#c62828',marginTop:8,fontSize:'.85rem'}}>❌ {pinError}</p>}
+                </div>
+              }
+              onConfirm={handleEliminarConfirm}
+              onCancel={() => { setModalEliminar(null); setPin(''); setPinError(''); }}
+              loading={eliminando}
+              confirmLabel="Eliminar"
+            />
+          )}
+        </>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       PÁGINA: Dashboard (comisiones activas)
+    ═══════════════════════════════════════════════════════════════ */
+    function Dashboard({ addAlert }) {
+      const [comisiones, setComisiones] = useState([]);
+      const [stats, setStats]           = useState(null);
+      const [loading, setLoading]       = useState(true);
+      const [filtros, setFiltros]       = useState({ tipo: '', responsable: '' });
+      const [responsables, setResponsables] = useState([]);
+
+      const cargar = useCallback(async () => {
+        setLoading(true);
+        try {
+          const [data, statsData, respData] = await Promise.all([
+            API.get('/comisiones/activas'),
+            API.get('/stats'),
+            API.get('/responsables')
+          ]);
+          setComisiones(data);
+          setStats(statsData);
+          setResponsables(respData.responsables || []);
+        } catch(e) {
+          addAlert('error', 'Error al cargar', e.message);
+        } finally {
+          setLoading(false);
+        }
+      }, []);
+
+      useEffect(() => { cargar(); }, [cargar]);
+
+      const handleAnular = async (id) => {
+        try {
+          await API.put(`/comisiones/${id}/anular`);
+          addAlert('success', 'Comisión anulada', `Comisión ID ${id} anulada correctamente.`);
+          cargar();
+        } catch(e) {
+          addAlert('error', 'Error al anular', e.message);
+        }
+      };
+
+      const handleEliminar = async (id, pin) => {
+        await API.del(`/comisiones/${id}`, { 'X-Admin-Pin': pin });
+        addAlert('success', 'Comisión eliminada', `Comisión ID ${id} eliminada permanentemente.`);
+        cargar();
+      };
+
+      const filtradas = comisiones.filter(c => {
+        if (filtros.tipo && c.tipo !== filtros.tipo) return false;
+        if (filtros.responsable && c.responsable !== filtros.responsable) return false;
+        return true;
+      });
+
+      const exportUrl = API.exportUrl({ solo_activas: true, tipo: filtros.tipo || undefined, responsable: filtros.responsable || undefined });
+
+      return (
+        <div className="page">
+          <div className="page-title">📋 Dashboard — Comisiones Activas</div>
+
+          <StatsGrid stats={stats} />
+
+          <div className="filters-bar">
+            <div className="filter-group">
+              <label>Tipo</label>
+              <select className="filter-select" value={filtros.tipo} onChange={e => setFiltros(f => ({...f, tipo: e.target.value}))}>
+                <option value="">Todos</option>
+                <option value="SKU">SKU</option>
+                <option value="Seller">Seller</option>
+              </select>
+            </div>
+            <div className="filter-group">
+              <label>Responsable</label>
+              <select className="filter-select" value={filtros.responsable} onChange={e => setFiltros(f => ({...f, responsable: e.target.value}))}>
+                <option value="">Todos</option>
+                {responsables.map(r => <option key={r} value={r}>{r}</option>)}
+              </select>
+            </div>
+            <div className="filter-actions">
+              <button className="btn btn-ghost" onClick={() => setFiltros({ tipo: '', responsable: '' })}>Limpiar</button>
+              <button className="btn btn-primary" onClick={cargar}>↺ Actualizar</button>
+              <a href={exportUrl} className="btn btn-outline" download>⬇ Exportar Excel</a>
+            </div>
+          </div>
+
+          <div className="table-wrap">
+            <div className="table-header-row">
+              <span className="table-count">
+                {loading ? 'Cargando...' : `${filtradas.length} comisión${filtradas.length !== 1 ? 'es' : ''} activa${filtradas.length !== 1 ? 's' : ''}`}
+              </span>
+            </div>
+            <ComisionesTable
+              comisiones={filtradas}
+              loading={loading}
+              onAnular={handleAnular}
+              showEstado={false}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       COMPONENTE: Carga Masiva de comisiones vía Excel
+    ═══════════════════════════════════════════════════════════════ */
+    function CargaMasiva({ addAlert, onSuccess }) {
+      const [archivo, setArchivo]   = useState(null);
+      const [procesando, setProcesando] = useState(false);
+      const [resultado, setResultado]   = useState(null);
+      const [dragOver, setDragOver]     = useState(false);
+      const inputRef = useRef(null);
+
+      const handleFile = (file) => {
+        if (!file) return;
+        const valido = file.name.endsWith('.xlsx') || file.name.endsWith('.xls');
+        if (!valido) { addAlert('error', 'Formato inválido', 'Solo se aceptan archivos .xlsx'); return; }
+        setArchivo(file);
+        setResultado(null);
+      };
+
+      const handleDrop = (e) => {
+        e.preventDefault();
+        setDragOver(false);
+        handleFile(e.dataTransfer.files[0]);
+      };
+
+      const handleProcesar = async () => {
+        if (!archivo) return;
+        setProcesando(true);
+        setResultado(null);
+        try {
+          const formData = new FormData();
+          formData.append('file', archivo);
+          const r = await fetch('/api/comisiones/masivo', { method: 'POST', body: formData });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.detail || 'Error al procesar');
+          setResultado(data);
+          if (data.insertados > 0) {
+            addAlert('success', `✅ ${data.insertados} comisiones cargadas`, 'Se enviará notificación por email.');
+            if (onSuccess) onSuccess();
+          }
+          if (data.errores?.length > 0) {
+            addAlert('warning', `⚠ ${data.errores.length} fila(s) con error`, 'Revisa el detalle abajo.');
+          }
+        } catch(e) {
+          addAlert('error', 'Error al procesar', e.message);
+        } finally {
+          setProcesando(false);
+        }
+      };
+
+      return (
+        <div style={{maxWidth: 680}}>
+          {/* Paso 1: descargar template */}
+          <div style={{
+            display:'flex', alignItems:'center', gap:16,
+            background:'rgba(0,166,80,.05)', border:'1px solid rgba(0,166,80,.2)',
+            borderRadius:8, padding:'16px 20px', marginBottom:20
+          }}>
+            <div style={{flex:1}}>
+              <div style={{fontWeight:600, marginBottom:4, fontSize:'.9rem'}}>
+                Paso 1 — Descarga el template Excel
+              </div>
+              <div style={{fontSize:'.82rem', color:'#5f6368', lineHeight:1.5}}>
+                Completa las columnas:{' '}
+                <code style={{background:'#e8eaf6',padding:'1px 5px',borderRadius:3,fontSize:'.78rem'}}>
+                  tipo, codigo, comision_anterior, comision_nueva, fecha_inicio, fecha_termino, responsable, motivo
+                </code>
+              </div>
+            </div>
+            <a href="/api/comisiones/template" download className="btn btn-outline" style={{flexShrink:0}}>
+              ⬇ Descargar Template
+            </a>
+          </div>
+
+          {/* Paso 2: subir archivo */}
+          <div style={{marginBottom:20}}>
+            <div style={{fontWeight:600, marginBottom:10, fontSize:'.9rem'}}>
+              Paso 2 — Sube el archivo completado
+            </div>
+            {!archivo ? (
+              <div
+                className={`dropzone ${dragOver ? 'drag-over' : ''}`}
+                onClick={() => inputRef.current.click()}
+                onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={handleDrop}
+              >
+                <div className="dropzone-icon">📂</div>
+                <div className="dropzone-text">Arrastra tu Excel aquí o haz clic para seleccionar</div>
+                <div className="dropzone-hint">Acepta .xlsx · máx. 5 MB</div>
+              </div>
+            ) : (
+              <div className="file-selected">
+                <span style={{fontSize:'1.3rem'}}>📗</span>
+                <span className="file-name">{archivo.name}</span>
+                <span style={{color:'#9aa0a6',fontSize:'.8rem'}}>{(archivo.size/1024).toFixed(1)} KB</span>
+                <button className="btn btn-ghost btn-sm" onClick={() => { setArchivo(null); setResultado(null); }}>
+                  ✕ Cambiar
+                </button>
+              </div>
+            )}
+            <input ref={inputRef} type="file" accept=".xlsx,.xls" style={{display:'none'}}
+              onChange={e => handleFile(e.target.files[0])} />
+          </div>
+
+          {/* Botón procesar */}
+          <div className="form-actions">
+            <button className="btn btn-primary" onClick={handleProcesar} disabled={!archivo || procesando}>
+              {procesando && <span className="spinner" style={{width:14,height:14}}></span>}
+              {procesando ? 'Procesando...' : '🚀 Procesar carga masiva'}
+            </button>
+            {archivo && (
+              <button className="btn btn-ghost" onClick={() => { setArchivo(null); setResultado(null); }}>
+                Cancelar
+              </button>
+            )}
+          </div>
+
+          {/* Resultado */}
+          {resultado && (
+            <div className="bulk-result" style={{marginTop:20}}>
+              <div className="bulk-result-ok">✅ {resultado.insertados} comisiones insertadas correctamente</div>
+              {resultado.errores?.length > 0 && (
+                <div style={{marginTop:12}}>
+                  <strong style={{color:'#c62828', fontSize:'.85rem'}}>
+                    ⚠ {resultado.errores.length} fila(s) con errores:
+                  </strong>
+                  {resultado.errores.map((e, i) => (
+                    <div key={i} className="bulk-error-item" style={{marginTop:4}}>
+                      Fila {e.fila}: {Array.isArray(e.errores) ? e.errores.join(', ') : e.errores}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       PÁGINA: Formulario Nueva Comisión
+    ═══════════════════════════════════════════════════════════════ */
+    function NuevaComision({ addAlert, onSuccess }) {
+      const [tab, setTab] = useState('individual');
+      const hoy = new Date().toISOString().split('T')[0];
+      const FORM_VACIO = {
+        tipo: 'SKU',
+        codigo: '',
+        comision_anterior: '',
+        comision_nueva: '',
+        fecha_inicio: hoy,
+        fecha_termino: '',
+        responsable: '',
+        motivo: ''
+      };
+
+      const [form, setForm]           = useState(FORM_VACIO);
+      const [errores, setErrores]     = useState({});
+      const [enviando, setEnviando]   = useState(false);
+      const [responsables, setResponsables] = useState([]);
+
+      useEffect(() => {
+        API.get('/responsables').then(d => setResponsables(d.responsables || [])).catch(() => {});
+      }, []);
+
+      const set = (k, v) => {
+        setForm(f => ({ ...f, [k]: v }));
+        if (errores[k]) setErrores(e => ({ ...e, [k]: '' }));
+      };
+
+      const validar = () => {
+        const e = {};
+        if (!form.codigo.trim())             e.codigo = 'El código es requerido';
+        if (form.comision_anterior === '')   e.comision_anterior = 'Ingresa la comisión actual';
+        if (form.comision_nueva === '')      e.comision_nueva = 'Ingresa la nueva comisión';
+        if (!form.fecha_inicio)              e.fecha_inicio = 'Selecciona fecha de inicio';
+        if (!form.fecha_termino)             e.fecha_termino = 'Selecciona fecha de término';
+        if (!form.responsable)               e.responsable = 'Ingresa el nombre del responsable';
+
+        const ca = parseFloat(form.comision_anterior);
+        const cn = parseFloat(form.comision_nueva);
+        if (!isNaN(ca) && !isNaN(cn) && ca === cn)
+          e.comision_nueva = 'La comisión nueva debe ser distinta a la actual';
+        if (!isNaN(ca) && (ca < 0 || ca > 100))
+          e.comision_anterior = 'Debe estar entre 0 y 100';
+        if (!isNaN(cn) && (cn < 0 || cn > 100))
+          e.comision_nueva = 'Debe estar entre 0 y 100';
+        if (form.fecha_inicio && form.fecha_termino && form.fecha_termino <= form.fecha_inicio)
+          e.fecha_termino = 'La fecha de término debe ser posterior a la de inicio';
+
+        setErrores(e);
+        return Object.keys(e).length === 0;
+      };
+
+      const handleSubmit = async (e) => {
+        e.preventDefault();
+        if (!validar()) return;
+        setEnviando(true);
+        try {
+          const payload = {
+            ...form,
+            comision_anterior: parseFloat(form.comision_anterior),
+            comision_nueva: parseFloat(form.comision_nueva),
+          };
+          await API.post('/comisiones', payload);
+          addAlert('success', '✅ Comisión registrada',
+            `${form.tipo} ${form.codigo} → ${form.comision_nueva}%. Se enviará notificación por email.`);
+          setForm(FORM_VACIO);
+          if (onSuccess) onSuccess();
+        } catch (err) {
+          addAlert('error', 'Error al guardar', err.message);
+        } finally {
+          setEnviando(false);
+        }
+      };
+
+      const E = ({ field }) => errores[field]
+        ? <div className="form-error">{errores[field]}</div> : null;
+
+      const diff = (parseFloat(form.comision_nueva) || 0) - (parseFloat(form.comision_anterior) || 0);
+
+      return (
+        <div className="page">
+          <div className="page-title">➕ Nueva Comisión Temporal</div>
+
+          {/* Tab bar */}
+          <div className="tab-bar">
+            <button className={`tab-btn ${tab === 'individual' ? 'active' : ''}`} onClick={() => setTab('individual')}>
+              📝 Individual
+            </button>
+            <button className={`tab-btn ${tab === 'masivo' ? 'active' : ''}`} onClick={() => setTab('masivo')}>
+              📊 Carga Masiva
+            </button>
+          </div>
+
+          {tab === 'masivo' ? (
+            <div className="form-card">
+              <CargaMasiva addAlert={addAlert} onSuccess={onSuccess} />
+            </div>
+          ) : (
+            <form className="form-card" onSubmit={handleSubmit} noValidate>
+              <div className="form-grid">
+
+                {/* Tipo */}
+                <div className="form-group">
+                  <label className="form-label">Tipo <span className="required">*</span></label>
+                  <select className={`form-select ${errores.tipo ? 'error' : ''}`}
+                    value={form.tipo} onChange={e => set('tipo', e.target.value)}>
+                    <option value="SKU">SKU</option>
+                    <option value="Seller">Seller</option>
+                  </select>
+                </div>
+
+                {/* Código */}
+                <div className="form-group">
+                  <label className="form-label">
+                    {form.tipo === 'SKU' ? 'Código SKU' : 'ID / Nombre Seller'} <span className="required">*</span>
+                  </label>
+                  <input className={`form-input ${errores.codigo ? 'error' : ''}`}
+                    placeholder={form.tipo === 'SKU' ? 'Ej: 123456789' : 'Ej: SELLER-XYZ'}
+                    value={form.codigo} onChange={e => set('codigo', e.target.value)} />
+                  <E field="codigo" />
+                </div>
+
+                {/* Comisión anterior */}
+                <div className="form-group">
+                  <label className="form-label">Comisión actual (%) <span className="required">*</span></label>
+                  <input className={`form-input ${errores.comision_anterior ? 'error' : ''}`}
+                    type="number" min="0" max="100" step="0.1"
+                    placeholder="Ej: 15.0"
+                    value={form.comision_anterior} onChange={e => set('comision_anterior', e.target.value)} />
+                  <E field="comision_anterior" />
+                </div>
+
+                {/* Comisión nueva */}
+                <div className="form-group">
+                  <label className="form-label">Comisión nueva (%) <span className="required">*</span></label>
+                  <input className={`form-input ${errores.comision_nueva ? 'error' : ''}`}
+                    type="number" min="0" max="100" step="0.1"
+                    placeholder="Ej: 18.0"
+                    value={form.comision_nueva} onChange={e => set('comision_nueva', e.target.value)} />
+                  <E field="comision_nueva" />
+                  {form.comision_anterior && form.comision_nueva && !errores.comision_nueva && (
+                    <div className="form-hint">
+                      Variación: {diff > 0 ? <span style={{color:'#c62828'}}>▲ +{diff.toFixed(1)}%</span>
+                                           : <span style={{color:'#007A3D'}}>▼ {diff.toFixed(1)}%</span>}
+                    </div>
+                  )}
+                </div>
+
+                {/* Fecha inicio */}
+                <div className="form-group">
+                  <label className="form-label">Fecha de inicio <span className="required">*</span></label>
+                  <input className={`form-input ${errores.fecha_inicio ? 'error' : ''}`}
+                    type="date"
+                    value={form.fecha_inicio} onChange={e => set('fecha_inicio', e.target.value)} />
+                  <E field="fecha_inicio" />
+                </div>
+
+                {/* Fecha término */}
+                <div className="form-group">
+                  <label className="form-label">Fecha de término <span className="required">*</span></label>
+                  <input className={`form-input ${errores.fecha_termino ? 'error' : ''}`}
+                    type="date"
+                    min={form.fecha_inicio || hoy}
+                    value={form.fecha_termino} onChange={e => set('fecha_termino', e.target.value)} />
+                  <E field="fecha_termino" />
+                  {form.fecha_inicio && form.fecha_termino && !errores.fecha_termino && (
+                    <div className="form-hint">
+                      Duración: {Math.round((new Date(form.fecha_termino) - new Date(form.fecha_inicio)) / 86400000)} días
+                    </div>
+                  )}
+                </div>
+
+                {/* Responsable */}
+                <div className="form-group">
+                  <label className="form-label">Responsable <span className="required">*</span></label>
+                  <input className={`form-input ${errores.responsable ? 'error' : ''}`}
+                    placeholder="Nombre del responsable"
+                    value={form.responsable} onChange={e => set('responsable', e.target.value)} />
+                  <E field="responsable" />
+                </div>
+
+                {/* Motivo */}
+                <div className="form-group form-full">
+                  <label className="form-label">Motivo <span style={{opacity:.5,fontWeight:400}}>(opcional)</span></label>
+                  <textarea className="form-textarea"
+                    placeholder="Describe el motivo del cambio de comisión..."
+                    value={form.motivo} onChange={e => set('motivo', e.target.value)} />
+                </div>
+
+              </div>
+
+              {/* Resumen previo */}
+              {form.codigo && form.comision_anterior && form.comision_nueva && form.fecha_inicio && form.fecha_termino && (
+                <div style={{
+                  background:'rgba(0,166,80,.06)', border:'1px solid rgba(0,166,80,.25)', borderRadius:6,
+                  padding:'12px 16px', margin:'16px 0', fontSize:'.85rem'
+                }}>
+                  <strong>Resumen: </strong>
+                  {form.tipo} <code style={{background:'#e8eaf6',padding:'1px 5px',borderRadius:3}}>{form.codigo}</code>
+                  {' '}{form.comision_anterior}% → <strong>{form.comision_nueva}%</strong>
+                  {' '}del {formatFecha(form.fecha_inicio)} al {formatFecha(form.fecha_termino)}
+                  {form.responsable && ` · ${form.responsable}`}
+                </div>
+              )}
+
+              <div className="form-actions">
+                <button type="submit" className="btn btn-primary" disabled={enviando}>
+                  {enviando && <span className="spinner" style={{width:14,height:14}}></span>}
+                  {enviando ? 'Guardando...' : '💾 Cargar Comisión'}
+                </button>
+                <button type="button" className="btn btn-ghost"
+                  onClick={() => { setForm(FORM_VACIO); setErrores({}); }}>
+                  Limpiar
+                </button>
+              </div>
+
+              <div style={{marginTop:12,fontSize:'.78rem',color:'#9aa0a6'}}>
+                Al guardar, se enviará un email con los archivos Excel listos para cargar en la plataforma.
+              </div>
+            </form>
+          )}
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       PÁGINA: Histórico
+    ═══════════════════════════════════════════════════════════════ */
+    function Historico({ addAlert }) {
+      const [comisiones, setComisiones] = useState([]);
+      const [loading, setLoading]       = useState(true);
+      const [responsables, setResponsables] = useState([]);
+      const [filtros, setFiltros]       = useState({
+        tipo: '', estado: '', responsable: '', codigo: '',
+        fecha_inicio_desde: '', fecha_inicio_hasta: '',
+        fecha_termino_desde: '', fecha_termino_hasta: ''
+      });
+      const [mostrarFiltros, setMostrarFiltros] = useState(false);
+
+      const cargar = useCallback(async () => {
+        setLoading(true);
+        try {
+          const params = Object.fromEntries(
+            Object.entries(filtros).filter(([,v]) => v !== '')
+          );
+          const [data, respData] = await Promise.all([
+            API.get('/comisiones', params),
+            API.get('/responsables')
+          ]);
+          setComisiones(data);
+          setResponsables(respData.responsables || []);
+        } catch(e) {
+          addAlert('error', 'Error al cargar histórico', e.message);
+        } finally {
+          setLoading(false);
+        }
+      }, [filtros]);
+
+      useEffect(() => { cargar(); }, []);
+
+      const handleAnular = async (id) => {
+        try {
+          await API.put(`/comisiones/${id}/anular`);
+          addAlert('success', 'Comisión anulada', `Comisión ID ${id} anulada.`);
+          cargar();
+        } catch(e) {
+          addAlert('error', 'Error al anular', e.message);
+        }
+      };
+
+      const handleEliminar = async (id, pin) => {
+        await API.del(`/comisiones/${id}`, { 'X-Admin-Pin': pin });
+        addAlert('success', 'Comisión eliminada', `Comisión ID ${id} eliminada permanentemente.`);
+        cargar();
+      };
+
+      const setF = (k, v) => setFiltros(f => ({ ...f, [k]: v }));
+      const limpiar = () => setFiltros({
+        tipo: '', estado: '', responsable: '', codigo: '',
+        fecha_inicio_desde: '', fecha_inicio_hasta: '',
+        fecha_termino_desde: '', fecha_termino_hasta: ''
+      });
+
+      const exportParams = Object.fromEntries(Object.entries(filtros).filter(([,v]) => v !== ''));
+      const exportUrl = API.exportUrl(exportParams);
+
+      return (
+        <div className="page">
+          <div className="page-title">🗂 Histórico de Comisiones</div>
+
+          <div className="filters-bar">
+            {/* Filtros básicos siempre visibles */}
+            <div className="filter-group">
+              <label>Tipo</label>
+              <select className="filter-select" value={filtros.tipo} onChange={e => setF('tipo', e.target.value)}>
+                <option value="">Todos</option>
+                <option value="SKU">SKU</option>
+                <option value="Seller">Seller</option>
+              </select>
+            </div>
+            <div className="filter-group">
+              <label>Estado</label>
+              <select className="filter-select" value={filtros.estado} onChange={e => setF('estado', e.target.value)}>
+                <option value="">Todos</option>
+                {ESTADOS.map(s => <option key={s} value={s}>{ESTADOS_LABEL[s]}</option>)}
+              </select>
+            </div>
+            <div className="filter-group">
+              <label>Responsable</label>
+              <select className="filter-select" value={filtros.responsable} onChange={e => setF('responsable', e.target.value)}>
+                <option value="">Todos</option>
+                {responsables.map(r => <option key={r} value={r}>{r}</option>)}
+              </select>
+            </div>
+            <div className="filter-group">
+              <label>Buscar código</label>
+              <input className="filter-input" placeholder="SKU o Seller..."
+                value={filtros.codigo} onChange={e => setF('codigo', e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && cargar()} />
+            </div>
+
+            {/* Filtros avanzados toggle */}
+            <div className="filter-group">
+              <label>&nbsp;</label>
+              <button className="btn btn-ghost" onClick={() => setMostrarFiltros(m => !m)}>
+                {mostrarFiltros ? '▲ Menos filtros' : '▼ Más filtros'}
+              </button>
+            </div>
+
+            {/* Filtros de fechas */}
+            {mostrarFiltros && (
+              <>
+                <div className="filter-group">
+                  <label>F. Inicio desde</label>
+                  <input type="date" className="filter-input"
+                    value={filtros.fecha_inicio_desde} onChange={e => setF('fecha_inicio_desde', e.target.value)} />
+                </div>
+                <div className="filter-group">
+                  <label>F. Inicio hasta</label>
+                  <input type="date" className="filter-input"
+                    value={filtros.fecha_inicio_hasta} onChange={e => setF('fecha_inicio_hasta', e.target.value)} />
+                </div>
+                <div className="filter-group">
+                  <label>F. Término desde</label>
+                  <input type="date" className="filter-input"
+                    value={filtros.fecha_termino_desde} onChange={e => setF('fecha_termino_desde', e.target.value)} />
+                </div>
+                <div className="filter-group">
+                  <label>F. Término hasta</label>
+                  <input type="date" className="filter-input"
+                    value={filtros.fecha_termino_hasta} onChange={e => setF('fecha_termino_hasta', e.target.value)} />
+                </div>
+              </>
+            )}
+
+            <div className="filter-actions">
+              <button className="btn btn-ghost" onClick={limpiar}>Limpiar</button>
+              <button className="btn btn-primary" onClick={cargar}>🔍 Buscar</button>
+              <a href={exportUrl} className="btn btn-outline" download>⬇ Exportar Excel</a>
+            </div>
+          </div>
+
+          <div className="table-wrap">
+            <div className="table-header-row">
+              <span className="table-count">
+                {loading ? 'Cargando...' : `${comisiones.length} registro${comisiones.length !== 1 ? 's' : ''}`}
+              </span>
+            </div>
+            <ComisionesTable
+              comisiones={comisiones}
+              loading={loading}
+              onAnular={handleAnular}
+              onEliminar={handleEliminar}
+              showEstado={true}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       APP PRINCIPAL
+    ═══════════════════════════════════════════════════════════════ */
+    const APP_PIN = 'Growth';
+
+    function LoginScreen({ onLogin }) {
+      const [pin, setPin]   = useState('');
+      const [error, setError] = useState(false);
+
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        if (pin === APP_PIN) {
+          onLogin();
+        } else {
+          setError(true);
+          setPin('');
+          setTimeout(() => setError(false), 2000);
+        }
+      };
+
+      return (
+        <div style={{
+          minHeight:'100vh', display:'flex', alignItems:'center', justifyContent:'center',
+          background:'#f1f5f9'
+        }}>
+          <div style={{
+            background:'#fff', borderRadius:12, padding:'48px 40px', width:360,
+            boxShadow:'0 4px 24px rgba(0,0,0,.10)', textAlign:'center'
+          }}>
+            <div style={{marginBottom:24}}>
+              <svg width="160" height="24" viewBox="0 0 187 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path fillRule="evenodd" clipRule="evenodd" d="M71.8541 7.24407C74.8253 8.20226 76.657 10.2796 77.3779 13.2178C78.0681 16.0268 77.3003 18.7185 75.5768 20.8615C73.3019 23.6843 67.6188 24.9367 64.0942 22.1834L63.9656 23.3046H60.1571V17.9293V4.35758C60.1571 1.95018 62.1624 0 64.6333 0V8.38515C66.269 6.87431 69.1565 6.35546 71.8541 7.24407ZM69.2709 19.6727C71.1108 19.4699 72.3483 18.4163 72.8853 16.7087C73.6368 13.9176 72.0277 10.4765 67.8026 10.8979C65.7299 11.206 64.7355 12.7029 64.7355 12.7029V17.9273C65.9096 19.3208 67.531 19.8655 69.2709 19.6727ZM11.5295 4.18248H7.18195C5.6892 4.18248 4.47621 5.36133 4.47621 6.81451V9.35511H9.52623V13.5019H4.47621V23.6424C4.47621 26.0498 2.4709 28 0 28V7.00336C0 3.1547 3.204 0.0356369 7.15743 0.0356369H11.5295V4.18248ZM37.0615 23.3402H32.5853V4.40104C32.5853 1.99364 34.5906 0.043477 37.0615 0.043477V23.3402ZM104.237 23.3402H99.761V4.40104C99.761 1.99364 101.766 0.043477 104.237 0.043477V23.3402ZM107.28 23.3402H111.756V0.043477C109.285 0.043477 107.28 1.99364 107.28 4.40104V23.3402ZM88.9809 23.7598C82.2421 23.7598 79.4486 19.2014 79.7283 14.5457C79.9468 10.9276 82.8057 6.8086 88.7093 6.8086C95.3889 6.8086 98.0701 12.7028 97.0981 17.0664H84.5496C84.8008 18.7044 86.4324 19.8336 88.6317 19.9767C91.268 20.1477 92.967 18.2214 92.967 18.2214L96.3671 19.9688C94.7069 22.6585 92.0665 23.7598 88.9809 23.7598ZM88.7011 10.5956C85.5339 10.5758 84.566 13.1939 84.5823 13.9393H92.675C92.7485 13.2833 92.1012 10.6155 88.7011 10.5956ZM29.5814 7.65382C28.5767 7.65382 27.6557 7.99376 26.9308 8.55635C24.7294 7.00973 21.5091 6.2046 17.9539 7.3755C15.001 8.32772 13.1795 10.3932 12.4628 13.3135C11.7766 16.1065 12.5404 18.7843 14.2536 20.9094C16.5081 23.7045 22.1197 24.9509 25.6259 22.2592L25.9792 23.3407H29.5834V11.7092L29.5814 7.65382ZM25.1603 18.0945C23.9004 19.5119 22.2524 19.8339 20.5207 19.6431C18.6931 19.4403 17.4617 18.4841 16.9267 16.7844C16.1793 14.0113 17.7803 10.5006 21.9788 10.92C24.2863 11.2679 25.1583 12.902 25.1583 12.902V18.0945H25.1603ZM129.438 8.56009C130.163 7.99552 131.084 7.65756 132.089 7.65756H132.091V11.713V23.3444H128.487L128.133 22.263C124.627 24.9546 119.016 23.7082 116.761 20.9132C115.048 18.7881 114.284 16.1103 114.97 13.3172C115.687 10.3969 117.509 8.33147 120.461 7.37924C124.017 6.20834 127.237 7.01347 129.438 8.56009ZM123.028 19.6468C124.76 19.8377 126.408 19.5156 127.668 18.0982H127.666V12.9057C127.666 12.9057 126.794 11.2716 124.486 10.9238C120.288 10.5043 118.687 14.015 119.434 16.7882C119.969 18.4879 121.201 19.4441 123.028 19.6468ZM54.4985 8.55635C52.2972 7.00973 49.0769 6.2046 45.5216 7.3755C42.5688 8.32772 40.7473 10.3932 40.0305 13.3135C39.3444 16.1065 40.1081 18.7843 41.8214 20.9094C44.0758 23.7045 49.6874 24.9509 53.1936 22.2592L53.5469 23.3407H57.1512V11.7092V7.65183C56.1444 7.65381 55.2255 7.99177 54.4985 8.55635ZM52.7281 18.0945C51.4681 19.5119 49.8202 19.8339 48.0885 19.6431C46.2608 19.4403 45.0295 18.4841 44.4945 16.7844C43.7471 14.0113 45.348 10.5006 49.5465 10.92C51.8541 11.2679 52.726 12.902 52.726 12.902V18.0945H52.7281ZM151.327 16.6134C151.327 12.7946 154.321 9.91204 158.291 9.91204C162.275 9.91204 165.279 12.7926 165.281 16.6134C165.281 20.4501 162.275 23.3406 158.291 23.3406C154.321 23.3406 151.327 20.4501 151.327 16.6134ZM154.915 16.6114C154.915 18.6332 156.332 20.1002 158.289 20.1002C160.229 20.1002 161.693 18.6013 161.693 16.6114C161.693 14.6394 160.231 13.1524 158.289 13.1524C156.365 13.1524 154.915 14.6394 154.915 16.6114ZM181.778 9.91212C179.722 9.75905 177.964 10.7968 176.984 11.3872C175.859 10.5045 174.605 9.91212 173.002 9.91212C170.016 9.91212 166.969 11.6575 166.969 11.6575V23.0365H170.453V13.6037C171.015 13.2081 172.03 13.1545 172.597 13.1545C173.788 13.1545 175.176 14.063 175.176 15.5977V23.0365H178.66V14.7428C178.66 14.0749 178.472 13.7349 178.472 13.7349C180.796 12.4726 183.516 13.4348 183.516 15.5977V23.0365H187V15.546C186.998 11.908 184.108 10.0851 181.778 9.91212ZM145.299 13.1522C143.645 13.1522 142.248 14.514 141.977 16.0705C141.099 15.2376 139.945 14.679 138.66 14.5299C139.549 11.7925 142.177 9.9099 145.456 9.9099C148.368 9.9099 150.374 11.4983 150.374 11.4983L148.593 14.2218C148.593 14.2218 147.237 13.1522 145.299 13.1522ZM148.687 18.9547C148.687 18.9547 147.353 20.0978 145.301 20.0978C144.721 20.0978 144.174 19.9288 143.694 19.6426C143.704 19.7817 143.712 19.9209 143.712 20.062C143.712 21.1077 143.416 22.0857 142.902 22.9227C143.69 23.193 144.55 23.3401 145.46 23.3401C148.722 23.3401 150.551 21.5013 150.551 21.5013L148.687 18.9547ZM141.19 20.0642C141.19 21.7869 139.756 23.1833 137.986 23.1833C136.217 23.1833 134.782 21.7869 134.782 20.0642C134.782 18.3416 136.217 16.9452 137.986 16.9452C139.756 16.9452 141.19 18.3416 141.19 20.0642Z" fill="#009A3E"/>
+              </svg>
+            </div>
+            <p style={{color:'#5f6368', marginBottom:32, fontSize:'.9rem'}}>Commission Adjustments <strong>By MHK</strong></p>
+            <form onSubmit={handleSubmit}>
+              <input
+                type="password"
+                autoFocus
+                placeholder="Ingresa el PIN de acceso"
+                value={pin}
+                onChange={e => { setPin(e.target.value); setError(false); }}
+                style={{
+                  width:'100%', padding:'12px 16px', fontSize:'1rem',
+                  border: error ? '2px solid #c62828' : '2px solid #e0e0e0',
+                  borderRadius:8, outline:'none', boxSizing:'border-box',
+                  marginBottom:8, transition:'border .2s'
+                }}
+              />
+              {error && <p style={{color:'#c62828', fontSize:'.85rem', marginBottom:8}}>PIN incorrecto</p>}
+              <button type="submit" style={{
+                width:'100%', padding:'12px', fontSize:'1rem', fontWeight:600,
+                background:'#009A3E', color:'#fff', border:'none', borderRadius:8,
+                cursor:'pointer', marginTop:8
+              }}>Ingresar</button>
+            </form>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [autenticado, setAutenticado] = useState(
+        sessionStorage.getItem('cm_auth') === '1'
+      );
+      const [page, setPage]       = useState('dashboard');
+      const [alerts, setAlerts]   = useState([]);
+      const [stats, setStats]     = useState(null);
+      const alertCounter          = useRef(0);
+
+      const handleLogin = () => {
+        sessionStorage.setItem('cm_auth', '1');
+        setAutenticado(true);
+      };
+
+      // Cargar stats para la barra de navegación
+      useEffect(() => {
+        const cargarStats = () => {
+          API.get('/stats').then(setStats).catch(() => {});
+        };
+        cargarStats();
+        const interval = setInterval(cargarStats, 60000); // Refrescar cada minuto
+        return () => clearInterval(interval);
+      }, []);
+
+      const addAlert = useCallback((type, title, message) => {
+        const id = ++alertCounter.current;
+        setAlerts(a => [...a, { id, type, title, message }]);
+        // Auto-dismiss después de 6 segundos
+        setTimeout(() => setAlerts(a => a.filter(x => x.id !== id)), 6000);
+      }, []);
+
+      const dismissAlert = useCallback((id) => {
+        setAlerts(a => a.filter(x => x.id !== id));
+      }, []);
+
+      const handleNuevaSuccess = () => {
+        // Actualizar stats después de cargar una comisión
+        API.get('/stats').then(setStats).catch(() => {});
+      };
+
+      return (
+        <>
+          {!autenticado ? (
+            <LoginScreen onLogin={handleLogin} />
+          ) : (
+            <>
+              <Navbar page={page} onChange={setPage} stats={stats} />
+
+              <AlertContainer alerts={alerts} onDismiss={dismissAlert} />
+
+              {page === 'dashboard' && <Dashboard addAlert={addAlert} />}
+              {page === 'nueva'     && <NuevaComision addAlert={addAlert} onSuccess={handleNuevaSuccess} />}
+              {page === 'historico' && <Historico addAlert={addAlert} />}
+            </>
+          )}
+        </>
+      );
+    }
+
+    /* ── Renderizar ─────────────────────────────────────────────── */
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
