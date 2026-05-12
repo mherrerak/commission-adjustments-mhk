@@ -99,9 +99,14 @@ def _enviar_resend(subject: str, html: str, adjuntos: list, cfg: dict):
         },
         method="POST"
     )
-    with urllib.request.urlopen(req) as resp:
-        result = json.loads(resp.read().decode())
-    logger.info(f"✉️  Email enviado via Resend a {cfg['destinatario']}: {subject} (id={result.get('id')})")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read().decode())
+        logger.info(f"✉️  Email enviado via Resend a {cfg['destinatario']}: {subject} (id={result.get('id')})")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        logger.error(f"Resend HTTP {e.code}: {e.reason} | from={cfg['remitente']} to={cfg['destinatario']} | body={body}")
+        raise
 
 
 def _cuerpo_html_carga(items: List[Dict[str, Any]]) -> str:
