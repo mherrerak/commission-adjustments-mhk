@@ -65,6 +65,45 @@ def _enviar_smtp(msg: MIMEMultipart, cfg: dict):
     logger.info(f"✉️  Email enviado a {cfg['destinatario']}: {msg['Subject']}")
 
 
+def _enviar_resend(subject: str, html: str, adjuntos: list, cfg: dict):
+    """Envía email via Resend API (HTTP) — no requiere SMTP abierto."""
+    import urllib.request
+    import urllib.error
+    import json
+    import base64
+
+    api_key = os.getenv("RESEND_API_KEY", "")
+    attachments = []
+    for nombre, contenido_bytes in adjuntos:
+        attachments.append({
+            "filename": nombre,
+            "content": base64.b64encode(contenido_bytes).decode("utf-8")
+        })
+
+    payload = {
+        "from": f"{cfg['remitente_nombre']} <{cfg['remitente']}>",
+        "to": [cfg["destinatario"]],
+        "subject": subject,
+        "html": html,
+    }
+    if attachments:
+        payload["attachments"] = attachments
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req) as resp:
+        result = json.loads(resp.read().decode())
+    logger.info(f"✉️  Email enviado via Resend a {cfg['destinatario']}: {subject} (id={result.get('id')})")
+
+
 def _cuerpo_html_carga(items: List[Dict[str, Any]]) -> str:
     """Genera el cuerpo HTML del email de carga de comisiones."""
     hoy = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -257,18 +296,26 @@ def enviar_email_carga(items: List[Dict[str, Any]]) -> bool:
         # Cuerpo HTML
         msg.attach(MIMEText(_cuerpo_html_carga(items), "html", "utf-8"))
 
-        # Adjunto 1: Upload SKU
         skus_items = [i for i in items if i["tipo"] == "SKU"]
-        if skus_items:
-            excel1 = generar_upload_sku(skus_items)
-            _adjuntar_excel(msg, excel1, f"Upload_SKU_{date.today().isoformat()}.xlsx")
+        subject = f"[Comisiones] Nueva carga de comisión - {tipo_codigo} - {hoy_str}"
+        html = _cuerpo_html_carga(items)
 
-        # Adjunto 2: Upload SKU Value New
-        if skus_items:
-            excel2 = generar_upload_sku_value_new(skus_items)
-            _adjuntar_excel(msg, excel2, f"Upload_SKU_Value_New_{date.today().isoformat()}.xlsx")
-
-        _enviar_smtp(msg, cfg)
+        if os.getenv("RESEND_API_KEY"):
+            adjuntos = []
+            if skus_items:
+                adjuntos.append((f"Upload_SKU_{date.today().isoformat()}.xlsx", generar_upload_sku(skus_items)))
+                adjuntos.append((f"Upload_SKU_Value_New_{date.today().isoformat()}.xlsx", generar_upload_sku_value_new(skus_items)))
+            _enviar_resend(subject, html, adjuntos, cfg)
+        else:
+            msg = MIMEMultipart("mixed")
+            msg["From"] = f"{cfg['remitente_nombre']} <{cfg['remitente']}>"
+            msg["To"] = cfg["destinatario"]
+            msg["Subject"] = subject
+            msg.attach(MIMEText(html, "html", "utf-8"))
+            if skus_items:
+                _adjuntar_excel(msg, generar_upload_sku(skus_items), f"Upload_SKU_{date.today().isoformat()}.xlsx")
+                _adjuntar_excel(msg, generar_upload_sku_value_new(skus_items), f"Upload_SKU_Value_New_{date.today().isoformat()}.xlsx")
+            _enviar_smtp(msg, cfg)
         return True
 
     except Exception as e:
@@ -296,20 +343,24 @@ def enviar_email_vencimiento(items: List[Dict[str, Any]]) -> bool:
         return False
 
     try:
-        msg = MIMEMultipart("mixed")
-        msg["From"] = f"{cfg['remitente_nombre']} <{cfg['remitente']}>"
-        msg["To"] = cfg["destinatario"]
-        msg["Subject"] = "⚠️ [Comisiones] SKUs/Sellers con comisión VENCIDA - Acción requerida"
-
-        msg.attach(MIMEText(_cuerpo_html_vencimiento(items), "html", "utf-8"))
-
-        # Adjunto 3: Reversa SKU (solo para SKU — agregar lógica Seller si aplica)
         skus_items = [i for i in items if i["tipo"] == "SKU"]
-        if skus_items:
-            excel3 = generar_reversa_sku(skus_items)
-            _adjuntar_excel(msg, excel3, f"Reversa_SKU_New_{date.today().isoformat()}.xlsx")
+        subject = "⚠️ [Comisiones] SKUs/Sellers con comisión VENCIDA - Acción requerida"
+        html = _cuerpo_html_vencimiento(items)
 
-        _enviar_smtp(msg, cfg)
+        if os.getenv("RESEND_API_KEY"):
+            adjuntos = []
+            if skus_items:
+                adjuntos.append((f"Reversa_SKU_New_{date.today().isoformat()}.xlsx", generar_reversa_sku(skus_items)))
+            _enviar_resend(subject, html, adjuntos, cfg)
+        else:
+            msg = MIMEMultipart("mixed")
+            msg["From"] = f"{cfg['remitente_nombre']} <{cfg['remitente']}>"
+            msg["To"] = cfg["destinatario"]
+            msg["Subject"] = subject
+            msg.attach(MIMEText(html, "html", "utf-8"))
+            if skus_items:
+                _adjuntar_excel(msg, generar_reversa_sku(skus_items), f"Reversa_SKU_New_{date.today().isoformat()}.xlsx")
+            _enviar_smtp(msg, cfg)
         return True
 
     except Exception as e:
@@ -333,14 +384,18 @@ def enviar_email_warning(items: List[Dict[str, Any]], dias_restantes: int) -> bo
         return False
 
     try:
-        msg = MIMEMultipart("mixed")
-        msg["From"] = f"{cfg['remitente_nombre']} <{cfg['remitente']}>"
-        msg["To"] = cfg["destinatario"]
-        msg["Subject"] = f"🔔 [Comisiones] {len(items)} comisión(es) vencen en {dias_restantes} día(s)"
+        subject = f"🔔 [Comisiones] {len(items)} comisión(es) vencen en {dias_restantes} día(s)"
+        html = _cuerpo_html_warning(items, dias_restantes)
 
-        msg.attach(MIMEText(_cuerpo_html_warning(items, dias_restantes), "html", "utf-8"))
-
-        _enviar_smtp(msg, cfg)
+        if os.getenv("RESEND_API_KEY"):
+            _enviar_resend(subject, html, [], cfg)
+        else:
+            msg = MIMEMultipart("mixed")
+            msg["From"] = f"{cfg['remitente_nombre']} <{cfg['remitente']}>"
+            msg["To"] = cfg["destinatario"]
+            msg["Subject"] = subject
+            msg.attach(MIMEText(html, "html", "utf-8"))
+            _enviar_smtp(msg, cfg)
         return True
 
     except Exception as e:
