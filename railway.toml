@@ -3,6 +3,6 @@ builder = "NIXPACKS"
 buildCommand = "pip install -r backend/requirements.txt && cp -r frontend backend/frontend"
 
 [deploy]
-startCommand = "cd backend && python main.py"
+startCommand = "bash -c 'cd backend && python main.py'"
 healthcheckPath = "/"
 healthcheckTimeout = 30

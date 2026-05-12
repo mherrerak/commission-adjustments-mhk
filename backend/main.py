@@ -88,36 +88,35 @@ app.include_router(commission_router, prefix="/api", tags=["Comisiones"])
 
 # ── Archivos estáticos del frontend ──────────────────────────────────────────
 
-# Railway sirve desde /app/backend, el frontend está en /app/frontend
-# En local está en commission-manager/frontend (un nivel arriba del backend)
-FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
-if not FRONTEND_DIR.exists():
-    # Fallback: buscar en el mismo nivel (por si se despliega con otra estructura)
-    FRONTEND_DIR = Path(__file__).parent / "frontend"
+# Buscar frontend en múltiples ubicaciones posibles
+_base = Path(__file__).parent
+_candidates = [
+    _base / "frontend",          # backend/frontend (Railway con cp en build)
+    _base.parent / "frontend",   # ../frontend (desarrollo local)
+]
+FRONTEND_DIR = next((p for p in _candidates if p.exists()), _base / "frontend")
 
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
-
-    @app.get("/", include_in_schema=False)
-    async def serve_index():
-        """Sirve el index.html del frontend SPA."""
-        index_path = FRONTEND_DIR / "index.html"
-        if index_path.exists():
-            return FileResponse(str(index_path))
-        return {"message": "Frontend no encontrado. Verifica la carpeta /frontend"}
-
-    # Catch-all para rutas del SPA (si se usan rutas del lado cliente)
-    @app.get("/{full_path:path}", include_in_schema=False)
-    async def serve_spa(full_path: str):
-        """Sirve el index.html para cualquier ruta no-API (SPA routing)."""
-        if full_path.startswith("api/"):
-            return {"error": "Not found"}
-        index_path = FRONTEND_DIR / "index.html"
-        if index_path.exists():
-            return FileResponse(str(index_path))
-        return {"message": "Frontend no encontrado"}
+    logger.info(f"✅ Frontend encontrado en: {FRONTEND_DIR}")
 else:
-    logger.warning(f"⚠️  Directorio frontend no encontrado: {FRONTEND_DIR}")
+    logger.warning(f"⚠️  Frontend no encontrado. Rutas buscadas: {_candidates}")
+
+@app.get("/", include_in_schema=False)
+async def serve_index():
+    index_path = FRONTEND_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(str(index_path))
+    return {"status": "ok", "message": "Commission Manager API corriendo. Frontend no encontrado.", "api_docs": "/api/docs"}
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_spa(full_path: str):
+    if full_path.startswith("api/"):
+        return {"error": "Not found"}
+    index_path = FRONTEND_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(str(index_path))
+    return {"status": "ok", "message": "Frontend no encontrado", "path": full_path}
 
 
 # ── Arranque directo ──────────────────────────────────────────────────────────
