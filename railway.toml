@@ -1,8 +1,6 @@
 [build]
-builder = "NIXPACKS"
-buildCommand = "pip install -r backend/requirements.txt"
+builder = "DOCKERFILE"
 
 [deploy]
-startCommand = "python backend/main.py"
 healthcheckPath = "/"
 healthcheckTimeout = 30
