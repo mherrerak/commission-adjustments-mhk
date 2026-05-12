@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gestión de Comisiones — Falabella Marketplace</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <!-- React + ReactDOM vía CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel Standalone para transpilación de JSX en el navegador -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    /* ═══════════════════════════════════════════════════════════════
+       CAPA DE API — todas las llamadas al backend centralizadas aquí
+    ═══════════════════════════════════════════════════════════════ */
+    const API = {
+      base: '/api',
+
+      async get(path, params = {}) {
+        const qs = new URLSearchParams(
+          Object.fromEntries(Object.entries(params).filter(([,v]) => v !== null && v !== undefined && v !== ''))
+        ).toString();
+        const url = qs ? `${this.base}${path}?${qs}` : `${this.base}${path}`;
+        const r = await fetch(url);
+        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.detail || `Error ${r.status}`); }
+        return r.json();
+      },
+
+      async post(path, body) {
+        const r = await fetch(`${this.base}${path}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || `Error ${r.status}`);
+        return data;
+      },
+
+      async put(path) {
+        const r = await fetch(`${this.base}${path}`, { method: 'PUT' });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || `Error ${r.status}`);
+        return data;
+      },
+
+      exportUrl(params = {}) {
+        const qs = new URLSearchParams(
+          Object.fromEntries(Object.entries(params).filter(([,v]) => v !== null && v !== undefined && v !== ''))
+        ).toString();
+        return qs ? `${this.base}/comisiones/export?${qs}` : `${this.base}/comisiones/export`;
+      }
+    };
+
+    /* ═══════════════════════════════════════════════════════════════
+       UTILIDADES
+    ═══════════════════════════════════════════════════════════════ */
+    const ESTADOS = ['Activa', 'Programada', 'Vencida', 'Vencida_Notificada', 'Anulada'];
+    const ESTADOS_LABEL = {
+      'Activa': 'Activa',
+      'Programada': 'Programada',
+      'Vencida': 'Vencida',
+      'Vencida_Notificada': 'Vencida Notif.',
+      'Anulada': 'Anulada'
+    };
+
+    function BadgeEstado({ estado }) {
+      const cls = `badge badge-${estado.toLowerCase().replace('_','-')}`;
+      const icons = { Activa:'●', Programada:'◐', Vencida:'✕', Vencida_Notificada:'✕', Anulada:'—' };
+      return <span className={cls}>{icons[estado] || ''} {ESTADOS_LABEL[estado] || estado}</span>;
+    }
+
+    function ChipTipo({ tipo }) {
+      return tipo === 'SKU'
+        ? <span className="chip-sku">SKU</span>
+        : <span className="chip-seller">Seller</span>;
+    }
+
+    function DiasTag({ fechaTermino, estado }) {
+      if (estado === 'Programada') return <span className="dias-tag dias-futuro">Progr.</span>;
+      if (['Vencida','Vencida_Notificada','Anulada'].includes(estado))
+        return <span className="dias-tag dias-critico">Vencida</span>;
+      const hoy = new Date(); hoy.setHours(0,0,0,0);
+      const fin = new Date(fechaTermino + 'T00:00:00');
+      const dias = Math.round((fin - hoy) / 86400000);
+      if (dias < 0)  return <span className="dias-tag dias-critico">Vencida</span>;
+      if (dias === 0) return <span className="dias-tag dias-critico">⚠ Hoy</span>;
+      if (dias <= 2) return <span className="dias-tag dias-urgente">⚠ {dias}d</span>;
+      return <span className="dias-tag dias-normal">{dias}d</span>;
+    }
+
+    function VarComision({ anterior, nueva }) {
+      const diff = nueva - anterior;
+      if (diff > 0) return <span className="var-sube">▲ {diff.toFixed(1)}%</span>;
+      if (diff < 0) return <span className="var-baja">▼ {Math.abs(diff).toFixed(1)}%</span>;
+      return <span>—</span>;
+    }
+
+    function formatFecha(iso) {
+      if (!iso) return '—';
+      const [y, m, d] = iso.split('-');
+      return `${d}/${m}/${y}`;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       COMPONENTE: Toast / Notificaciones
+    ═══════════════════════════════════════════════════════════════ */
+    function AlertContainer({ alerts, onDismiss }) {
+      return (
+        <div className="alert-container">
+          {alerts.map(a => (
+            <div key={a.id} className={`alert alert-${a.type}`}>
+              <div className="alert-body">
+                <div className="alert-title">{a.title}</div>
+                {a.message && <div className="alert-msg">{a.message}</div>}
+              </div>
+              <button className="alert-close" onClick={() => onDismiss(a.id)}>×</button>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       COMPONENTE: Modal de confirmación
+    ═══════════════════════════════════════════════════════════════ */
+    function Modal({ title, body, onConfirm, onCancel, loading, confirmLabel = 'Confirmar', confirmClass = 'btn-danger' }) {
+      return (
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onCancel()}>
+          <div className="modal">
+            <div className="modal-title">{title}</div>
+            <div className="modal-body">{body}</div>
+            <div className="modal-actions">
+              <button className="btn btn-ghost" onClick={onCancel} disabled={loading}>Cancelar</button>
+              <button className={`btn ${confirmClass}`} onClick={onConfirm} disabled={loading}>
+                {loading && <span className="spinner" style={{width:14,height:14}}></span>}
+                {confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       COMPONENTE: Navbar
+    ═══════════════════════════════════════════════════════════════ */
+    function Navbar({ page, onChange, stats }) {
+      return (
+        <nav className="navbar">
+          <div className="navbar-brand">
+            📊 Comisiones
+            <span>Falabella Marketplace</span>
+          </div>
+          <div className="navbar-nav">
+            <button className={`nav-btn ${page === 'dashboard' ? 'active' : ''}`} onClick={() => onChange('dashboard')}>
+              📋 Dashboard
+            </button>
+            <button className={`nav-btn ${page === 'nueva' ? 'active' : ''}`} onClick={() => onChange('nueva')}>
+              ＋ Nueva Comisión
+            </button>
+            <button className={`nav-btn ${page === 'historico' ? 'active' : ''}`} onClick={() => onChange('historico')}>
+              🗂 Histórico
+            </button>
+          </div>
+          {stats && stats.proximas_a_vencer > 0 && (
+            <div className="navbar-status" style={{color:'#ffcc80'}}>
+              ⚠ {stats.proximas_a_vencer} vencen pronto
+            </div>
+          )}
+        </nav>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       COMPONENTE: Stats Cards
+    ═══════════════════════════════════════════════════════════════ */
+    function StatsGrid({ stats }) {
+      if (!stats) return null;
+      return (
+        <div className="stats-grid">
+          <div className="stat-card activa">
+            <div className="stat-label">Activas</div>
+            <div className="stat-value">{stats.total_activa ?? 0}</div>
+          </div>
+          <div className="stat-card programada">
+            <div className="stat-label">Programadas</div>
+            <div className="stat-value">{stats.total_programada ?? 0}</div>
+          </div>
+          <div className="stat-card warning">
+            <div className="stat-label">Vencen Pronto</div>
+            <div className="stat-value">{stats.proximas_a_vencer ?? 0}</div>
+          </div>
+          <div className="stat-card vencida">
+            <div className="stat-label">Vencidas</div>
+            <div className="stat-value">{(stats.total_vencida ?? 0) + (stats.total_vencida_notificada ?? 0)}</div>
+          </div>
+          <div className="stat-card anulada">
+            <div className="stat-label">Anuladas</div>
+            <div className="stat-value">{stats.total_anulada ?? 0}</div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       COMPONENTE: Tabla de comisiones (reutilizada en Dashboard e Histórico)
+    ═══════════════════════════════════════════════════════════════ */
+    function ComisionesTable({ comisiones, loading, onAnular, showEstado = true, exportParams = {} }) {
+      const [sortCol, setSortCol] = useState('fecha_termino');
+      const [sortDir, setSortDir] = useState('asc');
+      const [modalAnular, setModalAnular] = useState(null);
+      const [anulando, setAnulando] = useState(false);
+
+      const handleSort = (col) => {
+        if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+        else { setSortCol(col); setSortDir('asc'); }
+      };
+
+      const sorted = [...comisiones].sort((a, b) => {
+        let va = a[sortCol], vb = b[sortCol];
+        if (va === null || va === undefined) va = '';
+        if (vb === null || vb === undefined) vb = '';
+        const cmp = String(va).localeCompare(String(vb), undefined, { numeric: true });
+        return sortDir === 'asc' ? cmp : -cmp;
+      });
+
+      const SortTh = ({ col, label }) => (
+        <th onClick={() => handleSort(col)} className={sortCol === col ? 'sorted' : ''}>
+          {label}
+          <span className="sort-icon">{sortCol === col ? (sortDir === 'asc' ? ' ↑' : ' ↓') : ' ↕'}</span>
+        </th>
+      );
+
+      const handleAnularConfirm = async () => {
+        setAnulando(true);
+        try { await onAnular(modalAnular.id); }
+        finally { setAnulando(false); setModalAnular(null); }
+      };
+
+      const canAnular = (c) => ['Activa', 'Programada'].includes(c.estado);
+
+      if (loading) return <div className="loading"><span className="spinner"></span>Cargando comisiones...</div>;
+
+      if (!comisiones.length) return (
+        <div className="empty-state">
+          <div className="empty-state-icon">📭</div>
+          <div className="empty-state-msg">No se encontraron comisiones con los filtros aplicados</div>
+        </div>
+      );
+
+      return (
+        <>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <SortTh col="tipo" label="Tipo" />
+                  <SortTh col="codigo" label="Código" />
+                  <SortTh col="comision_anterior" label="Com. Anterior" />
+                  <SortTh col="comision_nueva" label="Com. Nueva" />
+                  <th>Variación</th>
+                  <SortTh col="fecha_inicio" label="F. Inicio" />
+                  <SortTh col="fecha_termino" label="F. Término" />
+                  <th>Días Rest.</th>
+                  <SortTh col="responsable" label="Responsable" />
+                  {showEstado && <SortTh col="estado" label="Estado" />}
+                  <th>Acciones</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map(c => (
+                  <tr key={c.id}>
+                    <td><ChipTipo tipo={c.tipo} /></td>
+                    <td><span className="code-cell">{c.codigo}</span></td>
+                    <td>{c.comision_anterior?.toFixed(1)}%</td>
+                    <td style={{fontWeight:600}}>{c.comision_nueva?.toFixed(1)}%</td>
+                    <td><VarComision anterior={c.comision_anterior} nueva={c.comision_nueva} /></td>
+                    <td>{formatFecha(c.fecha_inicio)}</td>
+                    <td>{formatFecha(c.fecha_termino)}</td>
+                    <td><DiasTag fechaTermino={c.fecha_termino} estado={c.estado} /></td>
+                    <td>{c.responsable}</td>
+                    {showEstado && <td><BadgeEstado estado={c.estado} /></td>}
+                    <td>
+                      {canAnular(c) ? (
+                        <button
+                          className="btn btn-sm btn-ghost"
+                          onClick={() => setModalAnular(c)}
+                          title="Anular comisión"
+                        >
+                          🗑 Anular
+                        </button>
+                      ) : (
+                        <span style={{color:'#9aa0a6',fontSize:'.75rem'}}>{c.estado}</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {modalAnular && (
+            <Modal
+              title="¿Anular esta comisión?"
+              body={
+                <span>
+                  ¿Confirmas que deseas anular la comisión del {modalAnular.tipo}{' '}
+                  <strong>{modalAnular.codigo}</strong> ({modalAnular.comision_nueva}%)?
+                  <br /><br />
+                  Esta acción no se puede deshacer.
+                </span>
+              }
+              onConfirm={handleAnularConfirm}
+              onCancel={() => setModalAnular(null)}
+              loading={anulando}
+              confirmLabel="Sí, anular"
+            />
+          )}
+        </>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       PÁGINA: Dashboard (comisiones activas)
+    ═══════════════════════════════════════════════════════════════ */
+    function Dashboard({ addAlert }) {
+      const [comisiones, setComisiones] = useState([]);
+      const [stats, setStats]           = useState(null);
+      const [loading, setLoading]       = useState(true);
+      const [filtros, setFiltros]       = useState({ tipo: '', responsable: '' });
+      const [responsables, setResponsables] = useState([]);
+
+      const cargar = useCallback(async () => {
+        setLoading(true);
+        try {
+          const [data, statsData, respData] = await Promise.all([
+            API.get('/comisiones/activas'),
+            API.get('/stats'),
+            API.get('/responsables')
+          ]);
+          setComisiones(data);
+          setStats(statsData);
+          setResponsables(respData.responsables || []);
+        } catch(e) {
+          addAlert('error', 'Error al cargar', e.message);
+        } finally {
+          setLoading(false);
+        }
+      }, []);
+
+      useEffect(() => { cargar(); }, [cargar]);
+
+      const handleAnular = async (id) => {
+        try {
+          await API.put(`/comisiones/${id}/anular`);
+          addAlert('success', 'Comisión anulada', `Comisión ID ${id} anulada correctamente.`);
+          cargar();
+        } catch(e) {
+          addAlert('error', 'Error al anular', e.message);
+        }
+      };
+
+      const filtradas = comisiones.filter(c => {
+        if (filtros.tipo && c.tipo !== filtros.tipo) return false;
+        if (filtros.responsable && c.responsable !== filtros.responsable) return false;
+        return true;
+      });
+
+      const exportUrl = API.exportUrl({ solo_activas: true, tipo: filtros.tipo || undefined, responsable: filtros.responsable || undefined });
+
+      return (
+        <div className="page">
+          <div className="page-title">📋 Dashboard — Comisiones Activas</div>
+
+          <StatsGrid stats={stats} />
+
+          <div className="filters-bar">
+            <div className="filter-group">
+              <label>Tipo</label>
+              <select className="filter-select" value={filtros.tipo} onChange={e => setFiltros(f => ({...f, tipo: e.target.value}))}>
+                <option value="">Todos</option>
+                <option value="SKU">SKU</option>
+                <option value="Seller">Seller</option>
+              </select>
+            </div>
+            <div className="filter-group">
+              <label>Responsable</label>
+              <select className="filter-select" value={filtros.responsable} onChange={e => setFiltros(f => ({...f, responsable: e.target.value}))}>
+                <option value="">Todos</option>
+                {responsables.map(r => <option key={r} value={r}>{r}</option>)}
+              </select>
+            </div>
+            <div className="filter-actions">
+              <button className="btn btn-ghost" onClick={() => setFiltros({ tipo: '', responsable: '' })}>Limpiar</button>
+              <button className="btn btn-primary" onClick={cargar}>↺ Actualizar</button>
+              <a href={exportUrl} className="btn btn-outline" download>⬇ Exportar Excel</a>
+            </div>
+          </div>
+
+          <div className="table-wrap">
+            <div className="table-header-row">
+              <span className="table-count">
+                {loading ? 'Cargando...' : `${filtradas.length} comisión${filtradas.length !== 1 ? 'es' : ''} activa${filtradas.length !== 1 ? 's' : ''}`}
+              </span>
+            </div>
+            <ComisionesTable
+              comisiones={filtradas}
+              loading={loading}
+              onAnular={handleAnular}
+              showEstado={false}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       PÁGINA: Formulario Nueva Comisión
+    ═══════════════════════════════════════════════════════════════ */
+    function NuevaComision({ addAlert, onSuccess }) {
+      const hoy = new Date().toISOString().split('T')[0];
+      const FORM_VACIO = {
+        tipo: 'SKU',
+        codigo: '',
+        comision_anterior: '',
+        comision_nueva: '',
+        fecha_inicio: hoy,
+        fecha_termino: '',
+        responsable: '',
+        motivo: ''
+      };
+
+      const [form, setForm]           = useState(FORM_VACIO);
+      const [errores, setErrores]     = useState({});
+      const [enviando, setEnviando]   = useState(false);
+      const [responsables, setResponsables] = useState([]);
+
+      useEffect(() => {
+        API.get('/responsables').then(d => setResponsables(d.responsables || [])).catch(() => {});
+      }, []);
+
+      const set = (k, v) => {
+        setForm(f => ({ ...f, [k]: v }));
+        if (errores[k]) setErrores(e => ({ ...e, [k]: '' }));
+      };
+
+      const validar = () => {
+        const e = {};
+        if (!form.codigo.trim())             e.codigo = 'El código es requerido';
+        if (form.comision_anterior === '')   e.comision_anterior = 'Ingresa la comisión actual';
+        if (form.comision_nueva === '')      e.comision_nueva = 'Ingresa la nueva comisión';
+        if (!form.fecha_inicio)              e.fecha_inicio = 'Selecciona fecha de inicio';
+        if (!form.fecha_termino)             e.fecha_termino = 'Selecciona fecha de término';
+        if (!form.responsable)               e.responsable = 'Selecciona un responsable';
+
+        const ca = parseFloat(form.comision_anterior);
+        const cn = parseFloat(form.comision_nueva);
+        if (!isNaN(ca) && !isNaN(cn) && ca === cn)
+          e.comision_nueva = 'La comisión nueva debe ser distinta a la actual';
+        if (!isNaN(ca) && (ca < 0 || ca > 100))
+          e.comision_anterior = 'Debe estar entre 0 y 100';
+        if (!isNaN(cn) && (cn < 0 || cn > 100))
+          e.comision_nueva = 'Debe estar entre 0 y 100';
+        if (form.fecha_inicio && form.fecha_termino && form.fecha_termino <= form.fecha_inicio)
+          e.fecha_termino = 'La fecha de término debe ser posterior a la de inicio';
+
+        setErrores(e);
+        return Object.keys(e).length === 0;
+      };
+
+      const handleSubmit = async (e) => {
+        e.preventDefault();
+        if (!validar()) return;
+        setEnviando(true);
+        try {
+          const payload = {
+            ...form,
+            comision_anterior: parseFloat(form.comision_anterior),
+            comision_nueva: parseFloat(form.comision_nueva),
+          };
+          const res = await API.post('/comisiones', payload);
+          addAlert('success', '✅ Comisión registrada',
+            `${form.tipo} ${form.codigo} → ${form.comision_nueva}%. Se enviará notificación por email.`);
+          setForm(FORM_VACIO);
+          if (onSuccess) onSuccess();
+        } catch (err) {
+          addAlert('error', 'Error al guardar', err.message);
+        } finally {
+          setEnviando(false);
+        }
+      };
+
+      const E = ({ field }) => errores[field]
+        ? <div className="form-error">{errores[field]}</div> : null;
+
+      const variacion = (parseFloat(form.comision_anterior) || 0) - 0;
+      const diff = (parseFloat(form.comision_nueva) || 0) - (parseFloat(form.comision_anterior) || 0);
+
+      return (
+        <div className="page">
+          <div className="page-title">➕ Nueva Comisión Temporal</div>
+
+          <form className="form-card" onSubmit={handleSubmit} noValidate>
+            <div className="form-grid">
+
+              {/* Tipo */}
+              <div className="form-group">
+                <label className="form-label">Tipo <span className="required">*</span></label>
+                <select className={`form-select ${errores.tipo ? 'error' : ''}`}
+                  value={form.tipo} onChange={e => set('tipo', e.target.value)}>
+                  <option value="SKU">SKU</option>
+                  <option value="Seller">Seller</option>
+                </select>
+              </div>
+
+              {/* Código */}
+              <div className="form-group">
+                <label className="form-label">
+                  {form.tipo === 'SKU' ? 'Código SKU' : 'ID / Nombre Seller'} <span className="required">*</span>
+                </label>
+                <input className={`form-input ${errores.codigo ? 'error' : ''}`}
+                  placeholder={form.tipo === 'SKU' ? 'Ej: 123456789' : 'Ej: SELLER-XYZ'}
+                  value={form.codigo} onChange={e => set('codigo', e.target.value)} />
+                <E field="codigo" />
+              </div>
+
+              {/* Comisión anterior */}
+              <div className="form-group">
+                <label className="form-label">Comisión actual (%) <span className="required">*</span></label>
+                <input className={`form-input ${errores.comision_anterior ? 'error' : ''}`}
+                  type="number" min="0" max="100" step="0.1"
+                  placeholder="Ej: 15.0"
+                  value={form.comision_anterior} onChange={e => set('comision_anterior', e.target.value)} />
+                <E field="comision_anterior" />
+              </div>
+
+              {/* Comisión nueva */}
+              <div className="form-group">
+                <label className="form-label">Comisión nueva (%) <span className="required">*</span></label>
+                <input className={`form-input ${errores.comision_nueva ? 'error' : ''}`}
+                  type="number" min="0" max="100" step="0.1"
+                  placeholder="Ej: 18.0"
+                  value={form.comision_nueva} onChange={e => set('comision_nueva', e.target.value)} />
+                <E field="comision_nueva" />
+                {form.comision_anterior && form.comision_nueva && !errores.comision_nueva && (
+                  <div className="form-hint">
+                    Variación: {diff > 0 ? <span style={{color:'#c62828'}}>▲ +{diff.toFixed(1)}%</span>
+                                         : <span style={{color:'#2e7d32'}}>▼ {diff.toFixed(1)}%</span>}
+                  </div>
+                )}
+              </div>
+
+              {/* Fecha inicio */}
+              <div className="form-group">
+                <label className="form-label">Fecha de inicio <span className="required">*</span></label>
+                <input className={`form-input ${errores.fecha_inicio ? 'error' : ''}`}
+                  type="date"
+                  value={form.fecha_inicio} onChange={e => set('fecha_inicio', e.target.value)} />
+                <E field="fecha_inicio" />
+              </div>
+
+              {/* Fecha término */}
+              <div className="form-group">
+                <label className="form-label">Fecha de término <span className="required">*</span></label>
+                <input className={`form-input ${errores.fecha_termino ? 'error' : ''}`}
+                  type="date"
+                  min={form.fecha_inicio || hoy}
+                  value={form.fecha_termino} onChange={e => set('fecha_termino', e.target.value)} />
+                <E field="fecha_termino" />
+                {form.fecha_inicio && form.fecha_termino && !errores.fecha_termino && (
+                  <div className="form-hint">
+                    Duración: {Math.round((new Date(form.fecha_termino) - new Date(form.fecha_inicio)) / 86400000)} días
+                  </div>
+                )}
+              </div>
+
+              {/* Responsable */}
+              <div className="form-group">
+                <label className="form-label">Responsable <span className="required">*</span></label>
+                {responsables.length > 0 ? (
+                  <select className={`form-select ${errores.responsable ? 'error' : ''}`}
+                    value={form.responsable} onChange={e => set('responsable', e.target.value)}>
+                    <option value="">— Seleccionar —</option>
+                    {responsables.map(r => <option key={r} value={r}>{r}</option>)}
+                  </select>
+                ) : (
+                  <input className={`form-input ${errores.responsable ? 'error' : ''}`}
+                    placeholder="Nombre del responsable"
+                    value={form.responsable} onChange={e => set('responsable', e.target.value)} />
+                )}
+                <E field="responsable" />
+              </div>
+
+              {/* Motivo */}
+              <div className="form-group form-full">
+                <label className="form-label">Motivo <span style={{opacity:.5,fontWeight:400}}>(opcional)</span></label>
+                <textarea className="form-textarea"
+                  placeholder="Describe el motivo del cambio de comisión..."
+                  value={form.motivo} onChange={e => set('motivo', e.target.value)} />
+              </div>
+
+            </div>
+
+            {/* Resumen previo */}
+            {form.codigo && form.comision_anterior && form.comision_nueva && form.fecha_inicio && form.fecha_termino && (
+              <div style={{
+                background:'#f0f4ff', border:'1px solid #c5cae9', borderRadius:6,
+                padding:'12px 16px', margin:'16px 0', fontSize:'.85rem'
+              }}>
+                <strong>Resumen: </strong>
+                {form.tipo} <code style={{background:'#e8eaf6',padding:'1px 5px',borderRadius:3}}>{form.codigo}</code>
+                {' '}{form.comision_anterior}% → <strong>{form.comision_nueva}%</strong>
+                {' '}del {formatFecha(form.fecha_inicio)} al {formatFecha(form.fecha_termino)}
+                {form.responsable && ` · ${form.responsable}`}
+              </div>
+            )}
+
+            <div className="form-actions">
+              <button type="submit" className="btn btn-primary" disabled={enviando}>
+                {enviando && <span className="spinner" style={{width:14,height:14}}></span>}
+                {enviando ? 'Guardando...' : '💾 Cargar Comisión'}
+              </button>
+              <button type="button" className="btn btn-ghost"
+                onClick={() => { setForm(FORM_VACIO); setErrores({}); }}>
+                Limpiar
+              </button>
+            </div>
+
+            <div style={{marginTop:12,fontSize:'.78rem',color:'#9aa0a6'}}>
+              Al guardar, se enviará un email con los archivos Excel listos para cargar en la plataforma.
+            </div>
+          </form>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       PÁGINA: Histórico
+    ═══════════════════════════════════════════════════════════════ */
+    function Historico({ addAlert }) {
+      const [comisiones, setComisiones] = useState([]);
+      const [loading, setLoading]       = useState(true);
+      const [responsables, setResponsables] = useState([]);
+      const [filtros, setFiltros]       = useState({
+        tipo: '', estado: '', responsable: '', codigo: '',
+        fecha_inicio_desde: '', fecha_inicio_hasta: '',
+        fecha_termino_desde: '', fecha_termino_hasta: ''
+      });
+      const [mostrarFiltros, setMostrarFiltros] = useState(false);
+
+      const cargar = useCallback(async () => {
+        setLoading(true);
+        try {
+          const params = Object.fromEntries(
+            Object.entries(filtros).filter(([,v]) => v !== '')
+          );
+          const [data, respData] = await Promise.all([
+            API.get('/comisiones', params),
+            API.get('/responsables')
+          ]);
+          setComisiones(data);
+          setResponsables(respData.responsables || []);
+        } catch(e) {
+          addAlert('error', 'Error al cargar histórico', e.message);
+        } finally {
+          setLoading(false);
+        }
+      }, [filtros]);
+
+      useEffect(() => { cargar(); }, []);
+
+      const handleAnular = async (id) => {
+        try {
+          await API.put(`/comisiones/${id}/anular`);
+          addAlert('success', 'Comisión anulada', `Comisión ID ${id} anulada.`);
+          cargar();
+        } catch(e) {
+          addAlert('error', 'Error al anular', e.message);
+        }
+      };
+
+      const setF = (k, v) => setFiltros(f => ({ ...f, [k]: v }));
+      const limpiar = () => setFiltros({
+        tipo: '', estado: '', responsable: '', codigo: '',
+        fecha_inicio_desde: '', fecha_inicio_hasta: '',
+        fecha_termino_desde: '', fecha_termino_hasta: ''
+      });
+
+      const exportParams = Object.fromEntries(Object.entries(filtros).filter(([,v]) => v !== ''));
+      const exportUrl = API.exportUrl(exportParams);
+
+      return (
+        <div className="page">
+          <div className="page-title">🗂 Histórico de Comisiones</div>
+
+          <div className="filters-bar">
+            {/* Filtros básicos siempre visibles */}
+            <div className="filter-group">
+              <label>Tipo</label>
+              <select className="filter-select" value={filtros.tipo} onChange={e => setF('tipo', e.target.value)}>
+                <option value="">Todos</option>
+                <option value="SKU">SKU</option>
+                <option value="Seller">Seller</option>
+              </select>
+            </div>
+            <div className="filter-group">
+              <label>Estado</label>
+              <select className="filter-select" value={filtros.estado} onChange={e => setF('estado', e.target.value)}>
+                <option value="">Todos</option>
+                {ESTADOS.map(s => <option key={s} value={s}>{ESTADOS_LABEL[s]}</option>)}
+              </select>
+            </div>
+            <div className="filter-group">
+              <label>Responsable</label>
+              <select className="filter-select" value={filtros.responsable} onChange={e => setF('responsable', e.target.value)}>
+                <option value="">Todos</option>
+                {responsables.map(r => <option key={r} value={r}>{r}</option>)}
+              </select>
+            </div>
+            <div className="filter-group">
+              <label>Buscar código</label>
+              <input className="filter-input" placeholder="SKU o Seller..."
+                value={filtros.codigo} onChange={e => setF('codigo', e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && cargar()} />
+            </div>
+
+            {/* Filtros avanzados toggle */}
+            <div className="filter-group">
+              <label>&nbsp;</label>
+              <button className="btn btn-ghost" onClick={() => setMostrarFiltros(m => !m)}>
+                {mostrarFiltros ? '▲ Menos filtros' : '▼ Más filtros'}
+              </button>
+            </div>
+
+            {/* Filtros de fechas */}
+            {mostrarFiltros && (
+              <>
+                <div className="filter-group">
+                  <label>F. Inicio desde</label>
+                  <input type="date" className="filter-input"
+                    value={filtros.fecha_inicio_desde} onChange={e => setF('fecha_inicio_desde', e.target.value)} />
+                </div>
+                <div className="filter-group">
+                  <label>F. Inicio hasta</label>
+                  <input type="date" className="filter-input"
+                    value={filtros.fecha_inicio_hasta} onChange={e => setF('fecha_inicio_hasta', e.target.value)} />
+                </div>
+                <div className="filter-group">
+                  <label>F. Término desde</label>
+                  <input type="date" className="filter-input"
+                    value={filtros.fecha_termino_desde} onChange={e => setF('fecha_termino_desde', e.target.value)} />
+                </div>
+                <div className="filter-group">
+                  <label>F. Término hasta</label>
+                  <input type="date" className="filter-input"
+                    value={filtros.fecha_termino_hasta} onChange={e => setF('fecha_termino_hasta', e.target.value)} />
+                </div>
+              </>
+            )}
+
+            <div className="filter-actions">
+              <button className="btn btn-ghost" onClick={limpiar}>Limpiar</button>
+              <button className="btn btn-primary" onClick={cargar}>🔍 Buscar</button>
+              <a href={exportUrl} className="btn btn-outline" download>⬇ Exportar Excel</a>
+            </div>
+          </div>
+
+          <div className="table-wrap">
+            <div className="table-header-row">
+              <span className="table-count">
+                {loading ? 'Cargando...' : `${comisiones.length} registro${comisiones.length !== 1 ? 's' : ''}`}
+              </span>
+            </div>
+            <ComisionesTable
+              comisiones={comisiones}
+              loading={loading}
+              onAnular={handleAnular}
+              showEstado={true}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       APP PRINCIPAL
+    ═══════════════════════════════════════════════════════════════ */
+    function App() {
+      const [page, setPage]       = useState('dashboard');
+      const [alerts, setAlerts]   = useState([]);
+      const [stats, setStats]     = useState(null);
+      const alertCounter          = useRef(0);
+
+      // Cargar stats para la barra de navegación
+      useEffect(() => {
+        const cargarStats = () => {
+          API.get('/stats').then(setStats).catch(() => {});
+        };
+        cargarStats();
+        const interval = setInterval(cargarStats, 60000); // Refrescar cada minuto
+        return () => clearInterval(interval);
+      }, []);
+
+      const addAlert = useCallback((type, title, message) => {
+        const id = ++alertCounter.current;
+        setAlerts(a => [...a, { id, type, title, message }]);
+        // Auto-dismiss después de 6 segundos
+        setTimeout(() => setAlerts(a => a.filter(x => x.id !== id)), 6000);
+      }, []);
+
+      const dismissAlert = useCallback((id) => {
+        setAlerts(a => a.filter(x => x.id !== id));
+      }, []);
+
+      const handleNuevaSuccess = () => {
+        // Actualizar stats después de cargar una comisión
+        API.get('/stats').then(setStats).catch(() => {});
+      };
+
+      return (
+        <>
+          <Navbar page={page} onChange={setPage} stats={stats} />
+
+          <AlertContainer alerts={alerts} onDismiss={dismissAlert} />
+
+          {page === 'dashboard' && <Dashboard addAlert={addAlert} />}
+          {page === 'nueva'     && <NuevaComision addAlert={addAlert} onSuccess={handleNuevaSuccess} />}
+          {page === 'historico' && <Historico addAlert={addAlert} />}
+        </>
+      );
+    }
+
+    /* ── Renderizar ─────────────────────────────────────────────── */
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

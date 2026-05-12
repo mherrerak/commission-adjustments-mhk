@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Base de datos local
+backend/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Variables de entorno (NUNCA subir al repo)
+backend/.env
+.env
+
+# Archivos temporales
+*.tmp
+_test_*.py
+
+# IDE
+.vscode/
+.idea/

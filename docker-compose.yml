@@ -1,0 +1,45 @@
+version: '3.9'
+
+services:
+  commission-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: commission-manager
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persistir la base de datos SQLite fuera del contenedor
+      - ./data:/app/backend/data
+    environment:
+      # ── Base de datos ──────────────────────────────────────────
+      DATABASE_PATH: /app/backend/data/comisiones.db
+
+      # ── Email SMTP ─────────────────────────────────────────────
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      EMAIL_DESTINATARIO: ${EMAIL_DESTINATARIO:-mherrerak@falabella.com}
+      EMAIL_REMITENTE: ${EMAIL_REMITENTE:-}
+      EMAIL_REMITENTE_NOMBRE: ${EMAIL_REMITENTE_NOMBRE:-Sistema de Comisiones}
+
+      # ── Scheduler ─────────────────────────────────────────────
+      CRON_HORA_UTC: ${CRON_HORA_UTC:-11}
+      CRON_MINUTO: ${CRON_MINUTO:-0}
+      DIAS_AVISO_VENCIMIENTO: ${DIAS_AVISO_VENCIMIENTO:-2}
+
+      # ── Equipo ────────────────────────────────────────────────
+      RESPONSABLES: ${RESPONSABLES:-Matías Herrera}
+
+      # ── App ───────────────────────────────────────────────────
+      PORT: 8000
+      AMBIENTE: production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/stats')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
